@@ -503,6 +503,35 @@ test("natural turn-taking: no double greeting, no reply to 'okay', never hangs u
   await client.close();
 });
 
+test("a promised call back becomes an open request that rings the user when answered", async () => {
+  const client = await mcp();
+  const n = dialed.length;
+  const callP = client.callTool({ name: "call_user", arguments: { message: "Hey, what's up?", timeout_seconds: 15 } });
+  while (dialed.length <= n) await sleep(10);
+  const { url, statusCallback } = dialed.at(-1)!;
+  const twiml = (await twilioPost(url, { CallStatus: "in-progress", AnsweredBy: "human" })).body;
+  const tw = await relay(attr(twiml, "url"));
+  tw.send({ type: "setup", callSid: `CA${dialed.length}`, customParameters: { cid: param(twiml, "cid"), secret: param(twiml, "secret") } });
+  tw.send({ type: "prompt", voicePrompt: "Plan my trip and just call me back when it's done.", last: true });
+  await tw.reply();
+  await twilioPost(statusCallback, { CallStatus: "completed" });
+  const first = JSON.parse(((await callP) as any).content[0].text);
+  const done = first.status === "completed"
+    ? first
+    : JSON.parse(((await client.callTool({ name: "wait_for_reply", arguments: { call_id: first.call_id, timeout_seconds: 10 } })) as any).content[0].text);
+  const cb = done.open_requests.find((r: any) => r.request_id === "req_callback");
+  assert.ok(cb, JSON.stringify(done.open_requests));
+  const before = dialed.length;
+  await client.callTool({
+    name: "answer_on_call",
+    arguments: { call_id: done.call_id, request_id: "req_callback", answer: "Your trip plan is ready." },
+  });
+  assert.equal(dialed.length, before + 1);
+  await twilioPost(dialed.at(-1)!.statusCallback, { CallStatus: "completed" });
+  tw.ws.close();
+  await client.close();
+});
+
 test("falls back to turn-by-turn if real-time voice never connects", async () => {
   const client = await mcp();
   const n = dialed.length;

@@ -90,7 +90,9 @@ export function groqLLM(apiKey: string, model: string, fallbackModel?: string): 
             model: m,
             messages: windowHistory(messages) as never,
             stream: true,
-            max_completion_tokens: 300,
+            // Generous: reasoning models spend part of this on hidden thinking, and running out cuts the reply
+            // mid-word. Spoken length is capped separately (MAX_TURN_CHARS).
+            max_completion_tokens: 1500,
             tools: VOICE_TOOLS,
             tool_choice: opts?.tools === false ? "none" : "auto",
             parallel_tool_calls: false,
@@ -109,6 +111,7 @@ export function groqLLM(apiKey: string, model: string, fallbackModel?: string): 
           if (ms > 2000) log.warn(`voice model slow to respond: ${ms}ms to first token`);
         }
         if (delta?.content) yield { type: "text", text: delta.content };
+        if (chunk.choices[0]?.finish_reason === "length") log.warn("voice model hit its token limit; reply was cut short");
         for (const tc of delta?.tool_calls ?? []) {
           const cur = calls.get(tc.index) ?? { id: "", type: "function" as const, function: { name: "", arguments: "" } };
           if (tc.id) cur.id = tc.id;
@@ -124,7 +127,7 @@ export function groqLLM(apiKey: string, model: string, fallbackModel?: string): 
         client.chat.completions.create({
           model: m,
           messages: messages as never,
-          max_completion_tokens: 800,
+          max_completion_tokens: 2000,
           ...reasoningFor(m),
         }),
       );
@@ -630,6 +633,8 @@ export function buildSystemPrompt(o: {
     "- Use it for anything you don't already know, anything current (news, prices, weather, flights), and anything they ask you to do.",
     "- Say a short natural line first, like \"Let me check.\" or \"Give me a few seconds.\", then call it with their full request.",
     "- Don't ask it again for something it already answered in this call, unless they want more or fresher info.",
+    "- When they add details or change something you already handed off (dates, budget, who's going, preferences),",
+    "  call ask_agent again right away with the updated, complete request so the work uses the right details.",
     "- To them you're one assistant: never mention a back office, another agent, or passing things along.",
     "- While waiting, keep chatting normally if they talk. Never guess or invent an answer.",
     "- Answers arrive as messages starting with [Update from your back office...]. The caller didn't say those. As soon as",
@@ -650,7 +655,11 @@ export function buildSystemPrompt(o: {
     .join("\n");
 }
 
-export function buildSummaryPrompt(transcript: { role: string; text: string }[], goal?: string): ChatMessage[] {
+export function buildSummaryPrompt(
+  transcript: { role: string; text: string }[],
+  goal?: string,
+  today?: string,
+): ChatMessage[] {
   const lines = transcript.map((t) => `${t.role === "user" ? "USER" : t.role === "agent" ? "ASSISTANT" : "NOTE"}: ${t.text}`);
   return [
     {
@@ -661,7 +670,10 @@ export function buildSummaryPrompt(transcript: { role: string; text: string }[],
         "user_decisions: what the user decided, approved or declined. follow_ups: things the user asked the agent to do " +
         "or questions left unanswered. Be specific and faithful to the transcript; use [] when there are none.",
     },
-    { role: "user", content: `${goal ? `Goal of the call: ${goal}\n\n` : ""}Transcript:\n${lines.join("\n")}` },
+    {
+      role: "user",
+      content: `${today ? `Today is ${today}.\n` : ""}${goal ? `Goal of the call: ${goal}\n\n` : ""}Transcript:\n${lines.join("\n")}`,
+    },
   ];
 }
 

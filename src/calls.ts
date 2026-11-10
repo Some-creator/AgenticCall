@@ -943,16 +943,42 @@ export class CallManager {
     rec.summarizing = true;
     try {
       const raw = await Promise.race([
-        this.llm!.complete(buildSummaryPrompt(rec.transcript, rec.goal)),
+        this.llm!.complete(
+          buildSummaryPrompt(
+            rec.transcript,
+            rec.goal,
+            new Date(this.now()).toLocaleDateString("en-US", { timeZone: this.cfg.timezone, dateStyle: "full" }),
+          ),
+        ),
         new Promise<string>((_, rej) => setTimeout(() => rej(new Error("timed out")), 12_000).unref()),
       ]);
       rec.outcome = parseSummary(raw);
     } catch (e) {
       log.warn(`call summary failed: ${(e as Error).message}`);
     } finally {
+      this.trackPromisedCallback(rec);
       rec.summarizing = false;
       this.notify(rec);
     }
+  }
+
+  /**
+   * The user asked to be called back but nothing is left open (the agent had already replied "I'll do it after
+   * the call"): open a request for it, so answering it rings them back automatically.
+   */
+  private trackPromisedCallback(rec: CallRecord): void {
+    const asked = rec.transcript.some((t) => t.role === "user" && /\bcall (me )?back\b/i.test(t.text));
+    if (!asked || rec.agentRequests.some((r) => r.status !== "answered")) return;
+    const what = rec.outcome?.follow_ups.length
+      ? rec.outcome.follow_ups.join("; ")
+      : rec.outcome?.summary || "the task they asked for during the call";
+    rec.agentRequests.push({
+      request_id: "req_callback",
+      request: `Finish this and call them back with the result: ${what}`,
+      asked_at: new Date(this.now()).toISOString(),
+      status: "delivered",
+    });
+    rec.transcript.push(this.turn("system", "User asked for a call back; opened req_callback."));
   }
 
   private setStatus(rec: CallRecord, status: CallStatus) {
