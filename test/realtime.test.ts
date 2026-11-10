@@ -9,7 +9,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { createApp } from "../src/app.js";
 import { CallManager, type Telephony } from "../src/calls.js";
 import type { Config } from "../src/config.js";
-import { attachRelayServer, MarkerFilter, type ChatMessage, type VoiceLLM } from "../src/realtime.js";
+import { attachRelayServer, MarkerFilter, type ChatMessage, type LLMEvent, type VoiceLLM } from "../src/realtime.js";
 
 const AUTH = "test_auth_token";
 const MCP_TOKEN = "secret-mcp-token";
@@ -22,20 +22,47 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // Replies like a voice model would, streaming tokens. Splits the end marker across tokens on purpose.
 const fakeLLM: VoiceLLM = {
-  async *stream(messages, signal) {
+  async *stream(messages, signal): AsyncIterable<LLMEvent> {
     llmCalls.push(messages.map((m) => ({ ...m })));
-    const last = messages.at(-1)!.content.toLowerCase();
+    const lastMsg = messages.at(-1)!;
+    const last = lastMsg.content.toLowerCase();
+    if (lastMsg.role === "system" && last.includes("dentist")) {
+      for (const t of ["Friday you've got ", "the dentist at 10. ", "Anything else?"]) yield { type: "text", text: t };
+      return;
+    }
+    if (lastMsg.role === "system" && last.includes("call them back when it's done")) {
+      for (const t of ["That'll take about 5 minutes. ", "Want to stay on, or should I call you back?"]) yield { type: "text", text: t };
+      return;
+    }
+    if (lastMsg.role === "user" && last.includes("call me back")) {
+      for (const t of ["Will do, I'll call you back. ", "Talk soon! [END_CALL]"]) yield { type: "text", text: t };
+      return;
+    }
+    if (lastMsg.role === "user" && last.includes("taxes")) {
+      yield {
+        type: "tool_call",
+        call: { id: "tc2", type: "function", function: { name: "ask_agent", arguments: '{"request":"Prepare my tax summary"}' } },
+      };
+      return;
+    }
+    if (lastMsg.role === "user" && last.includes("calendar")) {
+      yield {
+        type: "tool_call",
+        call: { id: "tc1", type: "function", function: { name: "ask_agent", arguments: '{"request":"What is on my calendar Friday?"}' } },
+      };
+      return;
+    }
     const tokens = last.includes("chat")
       ? ["Happy to! ", "Anything ", "else you'd like to test?", "No, ", "that's all. Goodbye! [END_CALL]"]
       : last.includes("bye")
-      ? ["Okay, ", "talk soon!", " [END", "_CA", "LL]"]
-      : last.includes("story")
-        ? ["Once ", "upon ", "a ", "time ", "there ", "was ", "a ", "very ", "long ", "story."]
-        : ["Sure, ", "I'll move it ", "to 2pm. ", "Anything else?"];
+        ? ["Okay, ", "talk soon!", " [END", "_CA", "LL]"]
+        : last.includes("story")
+          ? ["Once ", "upon ", "a ", "time ", "there ", "was ", "a ", "very ", "long ", "story."]
+          : ["Sure, ", "I'll move it ", "to 2pm. ", "Anything else?"];
     for (const t of tokens) {
       if (signal.aborted) return;
       await sleep(last.includes("story") ? 40 : 2);
-      yield t;
+      yield { type: "text", text: t };
     }
   },
   async complete() {
@@ -78,6 +105,8 @@ before(async () => {
     quietHours: null,
     timezone: "America/New_York",
     defaultMode: "realtime",
+    agentAnswerTimeoutSeconds: 45,
+    callbackThresholdSeconds: 60,
     groq: { apiKey: "x", model: "test" },
     relay: {},
   } satisfies Config as Config;
@@ -244,11 +273,88 @@ test("real-time call: natural streamed conversation, interruption, goodbye and o
   await client.close();
 });
 
+test("real-time call: user asks something only the agent knows, mid-call", async () => {
+  const client = await mcp();
+  const callP = client.callTool({ name: "call_user", arguments: { message: "Quick check-in.", timeout_seconds: 20 } });
+  while (dialed.length < 2) await sleep(10);
+  const { url, statusCallback } = dialed.at(-1)!;
+  const twiml = (await twilioPost(url, { CallStatus: "in-progress", AnsweredBy: "human" })).body;
+  const tw = await relay(attr(twiml, "url"));
+  tw.send({ type: "setup", callSid: "CA2", customParameters: { cid: param(twiml, "cid"), secret: param(twiml, "secret") } });
+
+  tw.send({ type: "prompt", voicePrompt: "What's on my calendar Friday?", last: true });
+  // The voice model covers the gap naturally...
+  assert.equal(await tw.reply(), "One sec, let me check.");
+  // ...and the agent's pending call_user returns right away with the request.
+  const first = JSON.parse(((await callP) as any).content[0].text);
+  assert.deepEqual(first.agent_requests, [{ request_id: "req_1", request: "What is on my calendar Friday?" }]);
+  assert.equal(first.status, "in_progress");
+
+  // The agent answers; the voice model tells the user in its own words.
+  await client.callTool({
+    name: "answer_on_call",
+    arguments: { call_id: first.call_id, request_id: "req_1", answer: "Friday: dentist at 10am." },
+  });
+  assert.equal(await tw.reply(), "Friday you've got the dentist at 10. Anything else?");
+  const sent = llmCalls.at(-1)!;
+  assert.equal(sent.at(-1)!.role, "system");
+  assert.equal((sent.at(-2) as any).role, "tool");
+  assert.equal((sent.at(-3) as any).tool_calls[0].function.name, "ask_agent");
+
+  tw.send({ type: "prompt", voicePrompt: "No, bye!", last: true });
+  await tw.reply();
+  await tw.next((m) => m.type === "end", 6000);
+  await twilioPost(statusCallback, { CallStatus: "completed" });
+  const done = JSON.parse(
+    ((await client.callTool({ name: "wait_for_reply", arguments: { call_id: first.call_id, timeout_seconds: 10 } })) as any)
+      .content[0].text,
+  );
+  assert.equal(done.status, "completed");
+  assert.ok(done.transcript.some((t: any) => t.text.startsWith("Agent answered")));
+  tw.ws.close();
+  await client.close();
+});
+
+test("long request: agent estimates, user picks a call back, result lists open requests", async () => {
+  const client = await mcp();
+  const n = dialed.length;
+  const callP = client.callTool({ name: "call_user", arguments: { message: "Hey.", timeout_seconds: 20 } });
+  while (dialed.length <= n) await sleep(10);
+  const { url, statusCallback } = dialed.at(-1)!;
+  const twiml = (await twilioPost(url, { CallStatus: "in-progress", AnsweredBy: "human" })).body;
+  const tw = await relay(attr(twiml, "url"));
+  tw.send({ type: "setup", callSid: `CA${dialed.length}`, customParameters: { cid: param(twiml, "cid"), secret: param(twiml, "secret") } });
+
+  tw.send({ type: "prompt", voicePrompt: "Can you put together my taxes summary?", last: true });
+  assert.equal(await tw.reply(), "One sec, let me check.");
+  const first = JSON.parse(((await callP) as any).content[0].text);
+  const reqId = first.agent_requests[0].request_id;
+
+  await client.callTool({ name: "acknowledge_request", arguments: { call_id: first.call_id, request_id: reqId, eta_seconds: 300 } });
+  assert.equal(await tw.reply(), "That'll take about 5 minutes. Want to stay on, or should I call you back?");
+  assert.match(llmCalls.at(-1)!.at(-1)!.content, /about 5 minutes/);
+
+  tw.send({ type: "prompt", voicePrompt: "Just call me back.", last: true });
+  assert.equal(await tw.reply(), "Will do, I'll call you back. Talk soon! ");
+  await tw.next((m) => m.type === "end", 6000);
+  await twilioPost(statusCallback, { CallStatus: "completed" });
+
+  const done = JSON.parse(
+    ((await client.callTool({ name: "wait_for_reply", arguments: { call_id: first.call_id, timeout_seconds: 10 } })) as any)
+      .content[0].text,
+  );
+  assert.deepEqual(done.open_requests, [{ request_id: reqId, request: "Prepare my tax summary", eta_seconds: 300 }]);
+  assert.match(done.hint, /call_user/);
+  tw.ws.close();
+  await client.close();
+});
+
 test("falls back to turn-by-turn if real-time voice never connects", async () => {
   const client = await mcp();
+  const n = dialed.length;
   const callP = client.callTool({ name: "call_user", arguments: { message: "Quick question.", timeout_seconds: 10 } });
-  while (dialed.length < 2) await sleep(10);
-  const { url, statusCallback } = dialed[1];
+  while (dialed.length <= n) await sleep(10);
+  const { url, statusCallback } = dialed.at(-1)!;
   await twilioPost(url, { CallStatus: "in-progress", AnsweredBy: "human" });
   // Relay failed to start: Twilio goes straight to the Connect action.
   const fb = await twilioPost(statusCallback.replace("/status", "/relay-done"), { SessionStatus: "failed" });

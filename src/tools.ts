@@ -8,6 +8,17 @@ Real-time mode (the default when the server has it): a fast voice assistant runs
 you, naturally, like a person. Give call_user a clear opening message, a briefing with every fact the user may
 ask about, and the goal (what you need decided or learned). Then call wait_for_reply until the call ends; you
 get a summary, the user's decisions and follow-ups, and the transcript. Act on them afterwards.
+
+During a real-time call you stay on the line in the background: keep calling wait_for_reply in a loop.
+When a result contains agent_requests, the user just asked something only you can answer or do (check
+email, look at the calendar, send a message, ...). They are on the phone waiting, so handle it IMMEDIATELY
+with your own tools, then call answer_on_call with a short spoken-style answer (or what you did), then go
+back to wait_for_reply. Speed matters more than polish here.
+- If it will take more than ~10 seconds, FIRST call acknowledge_request with an honest eta_seconds, then do
+  the work. For long tasks the user is offered a call back; if the call ends before you answer, the result
+  lists open_requests: finish them and call_user back (or send_sms) with the result.
+- If you need something from the user to proceed, answer_on_call with the question; their reply comes back
+  as a new agent_request.
 Turn-by-turn mode: you answer each turn yourself, as described below.
 
 When to call: only for things that genuinely need the user's attention soon — urgent or time-sensitive
@@ -142,12 +153,53 @@ export function buildMcpServer(calls: CallManager): McpServer {
     {
       title: "Keep listening",
       description:
-        "Keep waiting. Realtime calls: returns when the call ends, with summary, decisions, follow-ups and transcript. " +
+        "Keep waiting. Realtime calls: returns as soon as the user asks something only you can handle (agent_requests " +
+        "— answer them with answer_on_call), or when the call ends, with summary, decisions, follow-ups and transcript. " +
         "Turn-by-turn calls: returns the user's next reply. Use whenever a result had still_waiting=true.",
       inputSchema: { call_id: callId, timeout_seconds: timeout },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
     async ({ call_id, timeout_seconds }) => guard(() => calls.waitForReply(call_id, timeout_seconds * 1000)),
+  );
+
+  server.registerTool(
+    "answer_on_call",
+    {
+      title: "Answer the user mid-call",
+      description:
+        "Answer a request the user made during a real-time call (from wait_for_reply's agent_requests). The voice " +
+        "assistant tells them right away, in its own words. Give the facts or what you did, in 1-3 plain sentences.",
+      inputSchema: {
+        call_id: callId,
+        request_id: z.string().describe("The request_id from agent_requests."),
+        answer: z
+          .string()
+          .min(1)
+          .max(2000)
+          .describe('The answer or result, e.g. "Friday you have the dentist at 10am and lunch with Priya at 1."'),
+      },
+      annotations: { destructiveHint: false, openWorldHint: true },
+    },
+    async ({ call_id, request_id, answer }) => guard(async () => calls.answerRequest(call_id, request_id, answer)),
+  );
+
+  server.registerTool(
+    "acknowledge_request",
+    {
+      title: "Give a time estimate mid-call",
+      description:
+        "Tell the user (via the voice assistant) how long a mid-call request will take, before doing slow work. " +
+        "Short estimates keep them on the line; long ones offer a call back when it's done.",
+      inputSchema: {
+        call_id: callId,
+        request_id: z.string().describe("The request_id from agent_requests."),
+        eta_seconds: z.number().int().min(1).max(86_400).describe("Honest estimate of how long until you can answer."),
+        note: z.string().max(300).optional().describe('Optional context, e.g. "Searching three months of email".'),
+      },
+      annotations: { destructiveHint: false, openWorldHint: true },
+    },
+    async ({ call_id, request_id, eta_seconds, note }) =>
+      guard(async () => calls.acknowledgeRequest(call_id, request_id, eta_seconds, note)),
   );
 
   server.registerTool(

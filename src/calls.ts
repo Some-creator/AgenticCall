@@ -18,6 +18,16 @@ const { VoiceResponse } = twilio.twiml;
 export type Urgency = "low" | "normal" | "high" | "critical";
 export type CallMode = "realtime" | "turn_by_turn";
 
+export interface AgentRequest {
+  request_id: string;
+  request: string;
+  asked_at: string;
+  /** pending: not yet seen by the agent; delivered: returned to the agent; answered: answer spoken to the user. */
+  status: "pending" | "delivered" | "answered";
+  answer?: string;
+  eta_seconds?: number;
+}
+
 export interface CallOutcome {
   summary: string;
   user_decisions: string[];
@@ -85,6 +95,8 @@ interface CallRecord {
   session?: RealtimeSession;
   outcome?: CallOutcome;
   summarizing: boolean;
+  agentRequests: AgentRequest[];
+  requestTimers: Map<string, NodeJS.Timeout>;
   /** Wakes anyone waiting for a change on this call (agent-side reply waits, Twilio hold long-polls). */
   listeners: Set<() => void>;
 }
@@ -141,6 +153,10 @@ export interface WaitResult {
   user_silent?: boolean;
   /** True if the wait timed out with the call still live; call wait_for_reply again to keep listening. */
   still_waiting?: boolean;
+  /** Real-time calls: questions/commands from the user that only you (the agent) can handle. Answer with answer_on_call. */
+  agent_requests?: { request_id: string; request: string }[];
+  /** Real-time calls that ended with requests still unanswered: finish them, then call back or text. */
+  open_requests?: { request_id: string; request: string; eta_seconds?: number }[];
   /** Real-time calls: what was said and decided, once the call has ended. */
   outcome?: CallOutcome;
   transcript?: Turn[];
@@ -224,6 +240,8 @@ export class CallManager {
       goal: input.goal,
       relaySecret: randomBytes(24).toString("hex"),
       summarizing: false,
+      agentRequests: [],
+      requestTimers: new Map(),
       listeners: new Set(),
     };
     rec.transcript.push(this.turn("agent", opening));
@@ -341,21 +359,43 @@ export class CallManager {
 
   private async waitForRealtime(rec: CallRecord, timeoutMs: number): Promise<WaitResult> {
     // Wait for the call to end (and its summary), or for a fallback to turn-by-turn mode.
+    const pending = () => rec.agentRequests.filter((r) => r.status === "pending");
     await this.waitFor(
       rec,
-      () => rec.mode !== "realtime" || (TERMINAL.has(rec.status) && !rec.summarizing),
+      () => rec.mode !== "realtime" || pending().length > 0 || (TERMINAL.has(rec.status) && !rec.summarizing),
       timeoutMs,
     );
     if (rec.mode !== "realtime") return this.waitForReply(rec.id, timeoutMs);
+    const asks = pending();
+    if (asks.length > 0 && !TERMINAL.has(rec.status)) {
+      for (const a of asks) a.status = "delivered";
+      return {
+        call_id: rec.id,
+        status: rec.status,
+        agent_requests: asks.map((a) => ({ request_id: a.request_id, request: a.request })),
+        hint:
+          "The user is ON THE LINE right now waiting for this. Handle it immediately with your own tools, then call " +
+          "answer_on_call with a short plain-spoken answer (or what you did). Then call wait_for_reply again.",
+      };
+    }
     if (TERMINAL.has(rec.status)) {
+      const open = rec.agentRequests
+        .filter((r) => r.status !== "answered")
+        .map((r) => ({ request_id: r.request_id, request: r.request, eta_seconds: r.eta_seconds }));
       return {
         call_id: rec.id,
         status: rec.status,
         outcome: rec.outcome,
+        open_requests: open.length > 0 ? open : undefined,
         transcript: rec.answeredAt ? rec.transcript : undefined,
-        hint: rec.outcome
-          ? "The call is over. Act on the user's decisions and follow-ups now; send_sms a short confirmation if useful."
-          : terminalHint(rec),
+        hint:
+          open.length > 0
+            ? "The call is over but the user is still waiting on open_requests. Finish them now. If the transcript " +
+              "shows they agreed to a call back, call_user with the results (or if it needs their input); otherwise " +
+              "send_sms the results."
+            : rec.outcome
+              ? "The call is over. Act on the user's decisions and follow-ups now; send_sms a short confirmation if useful."
+              : terminalHint(rec),
       };
     }
     return {
@@ -367,6 +407,73 @@ export class CallManager {
           ? "A voice assistant is talking with the user live. Call wait_for_reply again to get the outcome when it ends."
           : "The phone is still ringing / connecting. Call wait_for_reply again to keep waiting.",
     };
+  }
+
+  /** The agent's answer to a mid-call request: the voice model tells the user right away. */
+  answerRequest(id: string, requestId: string, answer: string): WaitResult {
+    const rec = this.mustGetLive(id);
+    const req = rec.agentRequests.find((r) => r.request_id === requestId);
+    if (!req) throw new CallError(`Unknown request_id ${requestId} on call ${id}`);
+    if (!rec.session) throw new CallError("This call isn't in real-time mode; use say_on_call instead.");
+    req.status = "answered";
+    req.answer = answer;
+    clearTimeout(rec.requestTimers.get(requestId));
+    rec.transcript.push(this.turn("system", `Agent answered "${req.request}": ${answer}`));
+    rec.session.deliver(
+      `Answer for the user's request "${req.request}": ${answer}\nTell them now, briefly and naturally. ` +
+        "If it's a question for the user, ask it, and pass their reply on with ask_agent.",
+    );
+    this.notify(rec);
+    return {
+      call_id: id,
+      status: rec.status,
+      hint: "Delivered; it's being spoken now. Call wait_for_reply to keep listening for more requests or the outcome.",
+    };
+  }
+
+  /** The agent's quick estimate of how long a mid-call request will take. */
+  acknowledgeRequest(id: string, requestId: string, etaSeconds: number, note?: string): WaitResult {
+    const rec = this.mustGetLive(id);
+    const req = rec.agentRequests.find((r) => r.request_id === requestId);
+    if (!req) throw new CallError(`Unknown request_id ${requestId} on call ${id}`);
+    if (!rec.session) throw new CallError("This call isn't in real-time mode.");
+    req.eta_seconds = etaSeconds;
+    const extra = note ? ` Note: ${note}` : "";
+    const long = etaSeconds > this.cfg.callbackThresholdSeconds;
+    const human = etaSeconds < 90 ? `about ${etaSeconds} seconds` : `about ${Math.round(etaSeconds / 60)} minutes`;
+    rec.transcript.push(this.turn("system", `Agent estimated ${human} for "${req.request}".${extra}`));
+    rec.session.deliver(
+      long
+        ? `"${req.request}" will take ${human}.${extra} Tell the user that, then ask whether they'd like to stay on ` +
+            "the line or have you call them back when it's done. If they want a call back, confirm, say goodbye and " +
+            `end the call with ${"[END_CALL]"}. If they stay, keep chatting until the answer arrives.`
+        : `"${req.request}" will take ${human}.${extra} Tell the user briefly (like "Give me about ${etaSeconds} ` +
+            'seconds"), then keep chatting normally if they talk.',
+    );
+    // Restart the "no answer yet" timer from the estimate.
+    this.armRequestTimer(rec, req, (etaSeconds + 20) * 1000);
+    this.notify(rec);
+    return {
+      call_id: id,
+      status: rec.status,
+      hint: long
+        ? "The user is being offered a call back. Keep working; call wait_for_reply to see if they stay or hang up."
+        : "Estimate delivered. Finish the work, then answer_on_call.",
+    };
+  }
+
+  private armRequestTimer(rec: CallRecord, req: AgentRequest, ms: number): void {
+    clearTimeout(rec.requestTimers.get(req.request_id));
+    const t = setTimeout(() => {
+      if (req.status !== "answered" && !TERMINAL.has(rec.status)) {
+        rec.session?.deliver(
+          `Still no answer for "${req.request}". Tell the user it's taking longer than expected and offer to call ` +
+            "them back when it's done. Don't make up an answer.",
+        );
+      }
+    }, ms);
+    t.unref();
+    rec.requestTimers.set(req.request_id, t);
   }
 
   async sendSms(body: string): Promise<string> {
@@ -482,6 +589,20 @@ export class CallManager {
       onAgent: (text) => {
         rec.transcript.push(this.turn("agent", text));
         this.notify(rec);
+      },
+      onAskAgent: (request) => {
+        const req: AgentRequest = {
+          request_id: `req_${rec.agentRequests.length + 1}`,
+          request,
+          asked_at: new Date(this.now()).toISOString(),
+          status: "pending",
+        };
+        rec.agentRequests.push(req);
+        rec.transcript.push(this.turn("system", `Asked agent: ${request}`));
+        log.info(`call ${rec.id}: request for agent: ${request}`);
+        this.notify(rec);
+        // If the agent doesn't answer (or estimate) in time, the voice model says so instead of leaving silence.
+        this.armRequestTimer(rec, req, this.cfg.agentAnswerTimeoutSeconds * 1000);
       },
       onInterrupted: (heard) => {
         rec.transcript.push(this.turn("system", `User interrupted after: "${heard}"`));

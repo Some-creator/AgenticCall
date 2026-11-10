@@ -85,6 +85,10 @@ export interface Config {
   timezone: string;
   /** "realtime": a fast voice model on this server runs the conversation. "turn_by_turn": the calling agent answers each turn. */
   defaultMode: "realtime" | "turn_by_turn";
+  /** How long the voice model waits for the calling agent to answer a mid-call request before saying so. */
+  agentAnswerTimeoutSeconds: number;
+  /** Requests estimated to take longer than this get a "stay on the line or call you back?" offer. */
+  callbackThresholdSeconds: number;
   groq: { apiKey: string | null; model: string };
   relay: { ttsProvider?: string; voice?: string; transcriptionProvider?: string; speechModel?: string };
 }
@@ -146,6 +150,8 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     maxCallsPerHour: int("MAX_CALLS_PER_HOUR", 6, 1, 1000),
     quietHours: parseQuietHours(process.env.QUIET_HOURS),
     timezone: optional("TIMEZONE", "America/New_York"),
+    agentAnswerTimeoutSeconds: int("AGENT_ANSWER_TIMEOUT_SECONDS", 45, 5, 600),
+    callbackThresholdSeconds: int("CALLBACK_THRESHOLD_SECONDS", 60, 5, 3600),
     defaultMode: callMode(process.env.CALL_MODE, Boolean(process.env.GROQ_API_KEY?.trim())),
     groq: {
       apiKey: process.env.GROQ_API_KEY?.trim() || null,

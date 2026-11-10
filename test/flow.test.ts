@@ -55,6 +55,8 @@ before(async () => {
     quietHours: null,
     timezone: "America/New_York",
     defaultMode: "turn_by_turn",
+    agentAnswerTimeoutSeconds: 45,
+    callbackThresholdSeconds: 60,
     groq: { apiKey: null, model: "test" },
     relay: {},
   };
@@ -107,7 +109,7 @@ test("rejects unsigned Twilio webhooks", async () => {
 test("full two-way conversation", async () => {
   const client = await mcpClient();
   const tools = (await client.listTools()).tools.map((t) => t.name).sort();
-  assert.deepEqual(tools, ["call_user", "end_call", "get_call", "list_calls", "say_on_call", "send_sms", "wait_for_reply"]);
+  assert.deepEqual(tools, ["acknowledge_request", "answer_on_call", "call_user", "end_call", "get_call", "list_calls", "say_on_call", "send_sms", "wait_for_reply"]);
 
   const callP = client.callTool({
     name: "call_user",

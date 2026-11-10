@@ -7,16 +7,48 @@ import { log } from "./log.js";
 
 // ---------------------------------------------------------------- voice model
 
-export interface ChatMessage {
-  role: "system" | "user" | "assistant";
-  content: string;
+export interface ToolCall {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
 }
+
+export type ChatMessage =
+  | { role: "system" | "user"; content: string }
+  | { role: "assistant"; content: string; tool_calls?: ToolCall[] }
+  | { role: "tool"; content: string; tool_call_id: string };
+
+export type LLMEvent = { type: "text"; text: string } | { type: "tool_call"; call: ToolCall };
 
 /** The fast model that holds the live conversation. A seam so tests can run without network access. */
 export interface VoiceLLM {
-  stream(messages: ChatMessage[], signal: AbortSignal): AsyncIterable<string>;
+  stream(messages: ChatMessage[], signal: AbortSignal): AsyncIterable<LLMEvent>;
   complete(messages: ChatMessage[]): Promise<string>;
 }
+
+export const ASK_AGENT_TOOL = "ask_agent";
+
+const VOICE_TOOLS = [
+  {
+    type: "function" as const,
+    function: {
+      name: ASK_AGENT_TOOL,
+      description:
+        "Hand a question or command to your back office, which has the user's email, calendar, files, accounts and " +
+        "the ability to take actions. Use it for anything not in your briefing, and for anything the user asks you to do.",
+      parameters: {
+        type: "object",
+        properties: {
+          request: {
+            type: "string",
+            description: "The user's question or instruction, restated clearly and completely with all details they gave.",
+          },
+        },
+        required: ["request"],
+      },
+    },
+  },
+];
 
 export function groqLLM(apiKey: string, model: string): VoiceLLM {
   const client = new Groq({ apiKey, maxRetries: 1 });
@@ -29,18 +61,36 @@ export function groqLLM(apiKey: string, model: string): VoiceLLM {
   return {
     async *stream(messages, signal) {
       const stream = await client.chat.completions.create(
-        { model, messages, stream: true, max_completion_tokens: 400, ...reasoning },
+        {
+          model,
+          messages: messages as never,
+          stream: true,
+          max_completion_tokens: 400,
+          tools: VOICE_TOOLS,
+          tool_choice: "auto",
+          parallel_tool_calls: false,
+          ...reasoning,
+        },
         { signal },
       );
+      const calls = new Map<number, ToolCall>();
       for await (const chunk of stream) {
-        const token = chunk.choices[0]?.delta?.content;
-        if (token) yield token;
+        const delta = chunk.choices[0]?.delta;
+        if (delta?.content) yield { type: "text", text: delta.content };
+        for (const tc of delta?.tool_calls ?? []) {
+          const cur = calls.get(tc.index) ?? { id: "", type: "function" as const, function: { name: "", arguments: "" } };
+          if (tc.id) cur.id = tc.id;
+          if (tc.function?.name) cur.function.name += tc.function.name;
+          if (tc.function?.arguments) cur.function.arguments += tc.function.arguments;
+          calls.set(tc.index, cur);
+        }
       }
+      for (const call of calls.values()) yield { type: "tool_call", call };
     },
     async complete(messages) {
       const res = await client.chat.completions.create({
         model,
-        messages,
+        messages: messages as never,
         max_completion_tokens: 800,
         ...reasoning,
       });
@@ -53,10 +103,14 @@ export function groqLLM(apiKey: string, model: string): VoiceLLM {
 
 export const END_MARKER = "[END_CALL]";
 
+const FILLERS = ["One sec, let me check.", "Sure, one moment.", "Okay, checking now.", "Give me a second."];
+
 export interface SessionHooks {
   onUser(text: string): void;
   onAgent(text: string): void;
   onInterrupted(heard: string): void;
+  /** The voice model needs the calling agent: a question or command it can't handle itself. */
+  onAskAgent(request: string): void;
   /** The model said goodbye; the session will close shortly. */
   onWrapUp(): void;
 }
@@ -69,19 +123,22 @@ export function speechMs(text: string): number {
 /**
  * Drives one ConversationRelay WebSocket: Twilio sends transcribed speech ("prompt"), we stream the
  * model's reply back token by token ("text"), and Twilio speaks it. If the caller talks over the
- * reply, Twilio sends "interrupt" and we stop generating.
+ * reply, Twilio sends "interrupt" and we stop generating. When the caller needs something only the
+ * calling agent can do, the model calls ask_agent; the agent's answer comes back via deliver().
  */
 export class RealtimeSession {
   private history: ChatMessage[];
   private inflight: AbortController | null = null;
+  private respondAgain = false;
   private ending = false;
   private endTimer: NodeJS.Timeout | null = null;
+  private fillerIdx = 0;
+  private closed = false;
 
   /** True while a goodbye is being spoken and the session is about to close. */
   get isEnding(): boolean {
     return this.ending;
   }
-  private closed = false;
 
   constructor(
     private ws: WebSocket,
@@ -116,7 +173,7 @@ export class RealtimeSession {
         const heard = String(msg.utteranceUntilInterrupt ?? "");
         const last = this.history.at(-1);
         // Keep only what the caller actually heard, so the model doesn't think it said more.
-        if (last?.role === "assistant") last.content = heard ? `${heard}…` : "…";
+        if (last?.role === "assistant" && !last.tool_calls) last.content = heard ? `${heard}…` : "…";
         // Talking over the goodbye means they're not done: keep the call open.
         if (this.ending && this.endTimer) {
           clearTimeout(this.endTimer);
@@ -134,12 +191,20 @@ export class RealtimeSession {
     }
   }
 
-  /** Speak text from the calling agent, outside the model's own turns. */
+  /** Speak text from the calling agent verbatim, outside the model's own turns. */
   inject(text: string): void {
     this.inflight?.abort();
     this.history.push({ role: "assistant", content: text });
     this.send({ type: "text", token: text, last: true });
     this.hooks.onAgent(text);
+  }
+
+  /** Hand the model new information (e.g. the agent's answer) and let it tell the caller. */
+  deliver(note: string): void {
+    if (this.ending || this.closed) return;
+    this.history.push({ role: "system", content: note });
+    if (this.inflight) this.respondAgain = true;
+    else void this.respond();
   }
 
   /** Say an optional goodbye, then end the session once it has been spoken. */
@@ -151,53 +216,98 @@ export class RealtimeSession {
 
   private async respond(): Promise<void> {
     this.inflight?.abort();
+    this.respondAgain = false;
     const ctrl = new AbortController();
     this.inflight = ctrl;
-    const entry: ChatMessage = { role: "assistant", content: "" };
+    const entry: { role: "assistant"; content: string; tool_calls?: ToolCall[] } = { role: "assistant", content: "" };
+    this.history.push(entry);
     const filter = new MarkerFilter(END_MARKER);
     let spoken = "";
+    let turnClosed = false; // sent last:true already
+    const toolCalls: ToolCall[] = [];
+    const speak = (text: string) => {
+      if (!text || turnClosed) return;
+      spoken += text;
+      entry.content = spoken;
+      this.send({ type: "text", token: text, last: false });
+    };
+    const closeTurn = () => {
+      if (turnClosed) return;
+      turnClosed = true;
+      this.send({ type: "text", token: "", last: true });
+    };
     try {
-      let askedQuestion = false;
-      for await (const token of this.llm.stream(this.history, ctrl.signal)) {
-        if (ctrl.signal.aborted) return;
-        let out = filter.push(token);
-        // A question hands the turn to the caller: stop there so the model can't answer for them.
+      for await (const ev of this.llm.stream(this.history.slice(0, -1), ctrl.signal)) {
+        if (ctrl.signal.aborted) break;
+        if (ev.type === "tool_call") {
+          toolCalls.push(ev.call);
+          continue;
+        }
+        if (turnClosed) continue; // drain the rest only to pick up tool calls
+        const out = filter.push(ev.text);
+        // A question hands the turn to the caller: stop speaking there so the model can't answer for them.
         const q = out.indexOf("?");
         if (q >= 0) {
-          out = out.slice(0, q + 1);
-          askedQuestion = true;
-        }
-        if (out) {
-          if (!spoken) this.history.push(entry);
-          spoken += out;
-          entry.content = spoken;
-          this.send({ type: "text", token: out, last: false });
-        }
-        if (askedQuestion) {
-          ctrl.abort();
-          break;
+          speak(out.slice(0, q + 1));
+          closeTurn();
+        } else {
+          speak(out);
         }
       }
-      if (ctrl.signal.aborted && !askedQuestion) return;
-      const tail = askedQuestion ? "" : filter.flush();
-      if (tail) {
-        if (!spoken) this.history.push(entry);
-        spoken += tail;
-        entry.content = spoken;
+      if (ctrl.signal.aborted) {
+        if (!spoken) this.removeEntry(entry);
+        return;
       }
-      this.send({ type: "text", token: tail, last: true });
+      if (!turnClosed) speak(filter.flush());
+
+      const ask = toolCalls.find((c) => c.function.name === ASK_AGENT_TOOL);
+      if (ask) {
+        if (!spoken.trim()) speak(FILLERS[this.fillerIdx++ % FILLERS.length]);
+        closeTurn();
+        ask.id ||= `call_${Date.now()}`;
+        entry.tool_calls = [ask];
+        let request = "";
+        try {
+          request = String(JSON.parse(ask.function.arguments || "{}").request ?? "");
+        } catch {
+          request = ask.function.arguments;
+        }
+        this.history.push({
+          role: "tool",
+          tool_call_id: ask.id,
+          content:
+            "Sent. The answer will arrive in a later system message. Until then keep chatting naturally if the user " +
+            "talks to you, but never guess or make up the answer.",
+        });
+        if (spoken.trim()) this.hooks.onAgent(spoken.trim());
+        if (request.trim()) this.hooks.onAskAgent(request.trim());
+        return;
+      }
+
+      closeTurn();
       if (spoken.trim()) this.hooks.onAgent(spoken.trim());
-      if (filter.found && !askedQuestion) this.wrapUp(spoken);
+      else this.removeEntry(entry);
+      if (filter.found && spoken.trim() && !spoken.includes("?")) this.wrapUp(spoken);
     } catch (err) {
       if (ctrl.signal.aborted) return;
       log.error(`voice model failed: ${(err as Error).message}`);
       const sorry = "Sorry, I'm having trouble on my end. I'll follow up by text.";
-      this.send({ type: "text", token: sorry, last: true });
+      turnClosed = false;
+      speak(` ${sorry}`);
+      closeTurn();
       this.hooks.onAgent(sorry);
       this.wrapUp(sorry);
     } finally {
-      if (this.inflight === ctrl) this.inflight = null;
+      if (this.inflight === ctrl) {
+        this.inflight = null;
+        if (this.respondAgain && !this.ending) void this.respond();
+      }
     }
+  }
+
+  private removeEntry(entry: ChatMessage): void {
+    const i = this.history.lastIndexOf(entry);
+    if (i >= 0) this.history.splice(i, 1);
   }
 
   private wrapUp(lastSpoken: string): void {
@@ -279,8 +389,13 @@ export function buildSystemPrompt(o: {
     `- Write ONLY your own words for this one turn. Never write what ${o.userName} says, never continue the conversation for them, and never assume their answer.`,
     "- If you ask a question, make it the last thing you say, then stop and wait for their reply.",
     "- Speech-to-text can mishear. If something sounds odd, briefly check what they meant.",
-    "- Only state facts from the briefing. If asked something you don't know, say you'll pass it on and follow up; never make things up.",
-    "- You can't take actions during the call. Note what they want done; their agent will do it after you hang up.",
+    "- You have a back office (the ask_agent tool) with their email, calendar, files and accounts, which can also take actions.",
+    "  Whenever they ask something not covered by what you know, or ask you to do anything (send, schedule, look up, change,",
+    "  remind), call ask_agent right away with their full request. Say a short natural line first, like \"One sec, let me check.\"",
+    "- To them you are one assistant. Never mention a back office, another agent, or passing things along.",
+    "- While waiting for an answer, keep chatting normally if they talk. Never guess or invent an answer.",
+    "- When an answer arrives (as a system message), tell them right away in a sentence or two, then ask if they need anything else.",
+    "- Only state facts from what you know or from those answers.",
     "- Before ending, confirm any decision or request back to them in one sentence.",
     `- Never end the call on your own initiative. If ${o.userName} sounds finished but hasn't said goodbye, ask something like "Anything else before I let you go?" and wait.`,
     `- Only after they say goodbye, or clearly say there's nothing else, reply with a short goodbye (no question) and put ${END_MARKER} at the very end.`,

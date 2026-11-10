@@ -29,6 +29,16 @@ Real-time mode uses Twilio's ConversationRelay, which streams speech recognition
 Twilio charges for it per minute, on top of normal call minutes. If it fails to start on your account,
 the server automatically switches that call to turn-by-turn.
 
+### Asking your agent things mid-call
+
+In real-time mode the voice can reach your agent live. Ask anything only the agent can answer or do, like
+"what's on my calendar Friday?" or "reply to Dana and say yes". The voice says "one sec, let me check",
+your agent handles it with its own tools, and the voice tells you the answer. Meanwhile you can keep talking.
+
+- If a task will take a while, the agent sends a time estimate first ("give me about 20 seconds").
+- For long tasks, the voice offers to stay on the line or call you back when the result is ready.
+- If the agent needs more from you, the voice asks you and passes your answer back.
+
 ## Features
 
 - **Two-way voice.** Twilio speech recognition turns your words into text for the agent, and neural
@@ -52,6 +62,8 @@ the server automatically switches that call to turn-by-turn.
 | `call_user` | Rings you, greets you ("Hi Sam, this is Muse."), says the message, and returns what you said back. |
 | `say_on_call` | Says the next line on the live call and returns your reply (`listen: false` just speaks). |
 | `wait_for_reply` | Keeps listening if a result came back with `still_waiting: true`, for example while the phone is still ringing. |
+| `answer_on_call` | Real-time calls: answers a question or command you gave mid-call; the voice tells you right away. |
+| `acknowledge_request` | Real-time calls: the agent's quick time estimate. Short waits keep you on the line; long ones offer a call back. |
 | `end_call` | Says goodbye, hangs up, and returns the transcript. |
 | `get_call` / `list_calls` | Return call status and transcripts. |
 | `send_sms` | Texts you for things that don't need a call, or as a summary after one. |
