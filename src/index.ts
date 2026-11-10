@@ -16,7 +16,7 @@ async function main() {
     );
   }
 
-  const llm = cfg.groq.apiKey ? groqLLM(cfg.groq.apiKey, cfg.groq.model) : undefined;
+  const llm = cfg.groq.apiKey ? groqLLM(cfg.groq.apiKey, cfg.groq.model, cfg.groq.fallbackModel) : undefined;
   const calls = new CallManager(cfg, twilioTelephony(cfg), { llm });
   const app = createApp(cfg, calls);
   const server = await new Promise<import("node:http").Server>((resolve) => {

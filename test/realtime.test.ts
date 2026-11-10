@@ -9,7 +9,16 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { createApp } from "../src/app.js";
 import { CallManager, type Telephony } from "../src/calls.js";
 import type { Config } from "../src/config.js";
-import { attachRelayServer, MarkerFilter, type ChatMessage, type LLMEvent, type VoiceLLM } from "../src/realtime.js";
+import {
+  attachRelayServer,
+  MarkerFilter,
+  speakable,
+  windowHistory,
+  type ChatMessage,
+  type LLMEvent,
+  type VoiceLLM,
+} from "../src/realtime.js";
+import { similarRequests } from "../src/calls.js";
 
 const AUTH = "test_auth_token";
 const MCP_TOKEN = "secret-mcp-token";
@@ -43,6 +52,10 @@ const fakeLLM: VoiceLLM = {
         type: "tool_call",
         call: { id: "tc2", type: "function", function: { name: "ask_agent", arguments: '{"request":"Prepare my tax summary"}' } },
       };
+      return;
+    }
+    if (lastMsg.role === "user" && last.includes("hold on")) {
+      yield { type: "tool_call", call: { id: "tc3", type: "function", function: { name: "ask_agent", arguments: '{"request":""}' } } };
       return;
     }
     if (lastMsg.role === "user" && last.includes("calendar")) {
@@ -107,7 +120,7 @@ before(async () => {
     defaultMode: "realtime",
     agentAnswerTimeoutSeconds: 45,
     callbackThresholdSeconds: 60,
-    groq: { apiKey: "x", model: "test" },
+    groq: { apiKey: "x", model: "test", fallbackModel: "test" },
     relay: {},
   } satisfies Config as Config;
   const calls = new CallManager(cfg, tel, { llm: fakeLLM });
@@ -187,6 +200,19 @@ async function relay(url: string) {
     },
   };
 }
+
+test("speech cleanup, request matching and history window", () => {
+  assert.equal(speakable("**Step 1:** run `ping`\n\n- then # reboot"), "Step 1: run ping - then  reboot");
+  const q = "Provide a brief explanation of why NVIDIA stock has declined in the past couple of days.";
+  assert.ok(similarRequests(q, `${q} It's mostly a broad AI chip selloff, not Nvidia news.`));
+  assert.ok(!similarRequests(q, "What's on my calendar Friday?"));
+  const msgs: ChatMessage[] = [{ role: "system", content: "s" }];
+  for (let i = 0; i < 40; i++) msgs.push({ role: i % 2 ? "assistant" : "user", content: String(i) });
+  const w = windowHistory(msgs, 10);
+  assert.equal(w[0].role, "system");
+  assert.equal(w[1].role, "user");
+  assert.ok(w.length <= 11);
+});
 
 test("marker filter hides the end marker even when split across tokens", () => {
   const f = new MarkerFilter("[END_CALL]");
@@ -302,6 +328,29 @@ test("real-time call: user asks something only the agent knows, mid-call", async
   assert.equal(sent.at(-1)!.role, "system");
   assert.equal((sent.at(-2) as any).role, "tool");
   assert.equal((sent.at(-3) as any).tool_calls[0].function.name, "ask_agent");
+
+  // The answer note is retired once used, so it can't keep prompting the model ("skip it" sticks).
+  await sleep(50);
+  tw.send({ type: "prompt", voicePrompt: "Okay cool", last: true });
+  await tw.reply();
+  const later = llmCalls.at(-1)!.map((m) => m.content).join("\n");
+  assert.match(later, /Already given to the user/);
+  assert.doesNotMatch(later, /Share it now/);
+
+  // Asking again for something already answered reuses the answer instead of bothering the agent.
+  tw.send({ type: "prompt", voicePrompt: "Wait, what's on my calendar Friday again?", last: true });
+  const again = (await tw.reply()) + (await tw.reply());
+  assert.match(again, /dentist at 10/);
+  const check = JSON.parse(
+    ((await client.callTool({ name: "wait_for_reply", arguments: { call_id: first.call_id, timeout_seconds: 5 } })) as any)
+      .content[0].text,
+  );
+  assert.equal(check.agent_requests, undefined);
+  assert.equal(check.still_waiting, true);
+
+  // An empty ask_agent call (e.g. "hold on") doesn't trigger "let me check".
+  tw.send({ type: "prompt", voicePrompt: "Hold on a sec", last: true });
+  assert.equal(await tw.reply(), "");
 
   tw.send({ type: "prompt", voicePrompt: "No, bye!", last: true });
   await tw.reply();

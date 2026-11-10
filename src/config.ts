@@ -89,7 +89,7 @@ export interface Config {
   agentAnswerTimeoutSeconds: number;
   /** Requests estimated to take longer than this get a "stay on the line or call you back?" offer. */
   callbackThresholdSeconds: number;
-  groq: { apiKey: string | null; model: string };
+  groq: { apiKey: string | null; model: string; fallbackModel: string };
   relay: { ttsProvider?: string; voice?: string; transcriptionProvider?: string; speechModel?: string };
 }
 
@@ -156,6 +156,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     groq: {
       apiKey: process.env.GROQ_API_KEY?.trim() || null,
       model: optional("GROQ_MODEL", "openai/gpt-oss-120b"),
+      fallbackModel: optional("GROQ_FALLBACK_MODEL", "openai/gpt-oss-20b"),
     },
     relay: {
       ttsProvider: process.env.RELAY_TTS_PROVIDER?.trim() || undefined,

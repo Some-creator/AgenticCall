@@ -57,7 +57,7 @@ before(async () => {
     defaultMode: "turn_by_turn",
     agentAnswerTimeoutSeconds: 45,
     callbackThresholdSeconds: 60,
-    groq: { apiKey: null, model: "test" },
+    groq: { apiKey: null, model: "test", fallbackModel: "test" },
     relay: {},
   };
   const calls = new CallManager(cfg, fakeTel);

@@ -46,7 +46,10 @@ const timeout = z
   .min(5)
   .max(110)
   .default(40)
-  .describe("Max seconds to wait for the user's spoken reply before returning (keep below your tool-call timeout).");
+  .describe(
+    "Max seconds to wait before returning (capped at 50 so it returns before typical 60s client tool timeouts). " +
+      "Just call again if still_waiting.",
+  );
 
 const callId = z.string().describe("The call_id returned by call_user.");
 

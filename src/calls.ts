@@ -5,6 +5,8 @@ import { isQuietTime, type Config } from "./config.js";
 import { log } from "./log.js";
 import {
   RealtimeSession,
+  answerNote,
+  type DeliveredNote,
   buildSummaryPrompt,
   buildSystemPrompt,
   parseSummary,
@@ -23,7 +25,7 @@ export interface AgentRequest {
   request: string;
   asked_at: string;
   /** pending: not yet seen by the agent; delivered: returned to the agent; answered: answer spoken to the user. */
-  status: "pending" | "delivered" | "answered";
+  status: "pending" | "delivered" | "acknowledged" | "answered";
   answer?: string;
   eta_seconds?: number;
 }
@@ -143,6 +145,28 @@ export function twilioTelephony(cfg: Config): Telephony {
 }
 
 export class CallError extends Error {}
+
+/** Longest a single wait may block. */
+export const MAX_WAIT_MS = 50_000;
+
+const STOPWORDS = new Set("a an the is are was were be to of for on in at my me i you your it this that and or what whats how can could would please".split(" "));
+
+function words(s: string): Set<string> {
+  return new Set(
+    s.toLowerCase().replace(/[^a-z0-9 ]+/g, " ").split(/\s+/).filter((w) => w.length > 1 && !STOPWORDS.has(w)),
+  );
+}
+
+/** True when two requests are about the same thing (one mostly contained in the other). */
+export function similarRequests(a: string, b: string): boolean {
+  const A = words(a);
+  const B = words(b);
+  const small = Math.min(A.size, B.size);
+  if (small < 2) return false;
+  let shared = 0;
+  for (const w of A) if (B.has(w)) shared++;
+  return shared / small >= 0.7;
+}
 
 export interface WaitResult {
   call_id: string;
@@ -280,11 +304,9 @@ export class CallManager {
           r.answer = message;
           clearTimeout(rec.requestTimers.get(r.request_id));
         }
-        rec.transcript.push(this.turn("system", `Agent answered "${open.map((r) => r.request).join("; ")}": ${message}`));
-        rec.session.deliver(
-          `Answer for the user's request "${open.map((r) => r.request).join("; ")}": ${message}\n` +
-            "Tell them now, briefly and naturally. If it's a question for the user, ask it, and pass their reply on with ask_agent.",
-        );
+        const what = open.map((r) => r.request).join("; ");
+        rec.transcript.push(this.turn("system", `Agent answered "${what}": ${message}`));
+        rec.session.deliver(answerNote(what, message));
         this.notify(rec);
         return {
           call_id: id,
@@ -335,6 +357,8 @@ export class CallManager {
   }
 
   async waitForReply(id: string, timeoutMs: number): Promise<WaitResult> {
+    // Many MCP clients give up on a tool call after 60s; a result returned after that is lost.
+    timeoutMs = Math.min(timeoutMs, MAX_WAIT_MS);
     const rec = this.get(id);
     if (rec.mode === "realtime") return this.waitForRealtime(rec, timeoutMs);
     await this.waitFor(rec, () => rec.replies.length > 0 || TERMINAL.has(rec.status), timeoutMs);
@@ -388,7 +412,17 @@ export class CallManager {
     if (rec.mode !== "realtime") return this.waitForReply(rec.id, timeoutMs);
     const asks = pending();
     if (asks.length > 0 && !TERMINAL.has(rec.status)) {
-      for (const a of asks) a.status = "delivered";
+      for (const a of asks) {
+        a.status = "delivered";
+        // If the agent never answers or estimates (say its wait timed out on its side and the result was lost),
+        // hand the request out again on the next wait instead of losing it.
+        setTimeout(() => {
+          if (a.status === "delivered" && !TERMINAL.has(rec.status)) {
+            a.status = "pending";
+            this.notify(rec);
+          }
+        }, 20_000).unref();
+      }
       return {
         call_id: rec.id,
         status: rec.status,
@@ -439,10 +473,7 @@ export class CallManager {
     req.answer = answer;
     clearTimeout(rec.requestTimers.get(requestId));
     rec.transcript.push(this.turn("system", `Agent answered "${req.request}": ${answer}`));
-    rec.session.deliver(
-      `Answer for the user's request "${req.request}": ${answer}\nTell them now, briefly and naturally. ` +
-        "If it's a question for the user, ask it, and pass their reply on with ask_agent.",
-    );
+    rec.session.deliver(answerNote(req.request, answer));
     this.notify(rec);
     return {
       call_id: id,
@@ -458,18 +489,20 @@ export class CallManager {
     if (!req) throw new CallError(`Unknown request_id ${requestId} on call ${id}`);
     if (!rec.session) throw new CallError("This call isn't in real-time mode.");
     req.eta_seconds = etaSeconds;
+    if (req.status !== "answered") req.status = "acknowledged";
     const extra = note ? ` Note: ${note}` : "";
     const long = etaSeconds > this.cfg.callbackThresholdSeconds;
     const human = etaSeconds < 90 ? `about ${etaSeconds} seconds` : `about ${Math.round(etaSeconds / 60)} minutes`;
     rec.transcript.push(this.turn("system", `Agent estimated ${human} for "${req.request}".${extra}`));
-    rec.session.deliver(
-      long
+    rec.session.deliver({
+      note: long
         ? `"${req.request}" will take ${human}.${extra} Tell the user that, then ask whether they'd like to stay on ` +
-            "the line or have you call them back when it's done. If they want a call back, confirm, say goodbye and " +
-            `end the call with ${"[END_CALL]"}. If they stay, keep chatting until the answer arrives.`
+          "the line or have you call them back when it's done. If they want a call back, confirm, say goodbye and " +
+          `end the call with ${"[END_CALL]"}. If they stay, keep chatting until the answer arrives.`
         : `"${req.request}" will take ${human}.${extra} Tell the user briefly (like "Give me about ${etaSeconds} ` +
-            'seconds"), then keep chatting normally if they talk.',
-    );
+          'seconds"), then keep chatting normally if they talk.',
+      after: `(Already told the user "${req.request}" would take ${human}.)`,
+    });
     // Restart the "no answer yet" timer from the estimate.
     this.armRequestTimer(rec, req, (etaSeconds + 20) * 1000);
     this.notify(rec);
@@ -486,10 +519,12 @@ export class CallManager {
     clearTimeout(rec.requestTimers.get(req.request_id));
     const t = setTimeout(() => {
       if (req.status !== "answered" && !TERMINAL.has(rec.status)) {
-        rec.session?.deliver(
-          `Still no answer for "${req.request}". Tell the user it's taking longer than expected and offer to call ` +
+        rec.session?.deliver({
+          note:
+            `Still no answer for "${req.request}". Tell the user it's taking longer than expected and offer to call ` +
             "them back when it's done. Don't make up an answer.",
-        );
+          after: `(Already told the user "${req.request}" is taking longer than expected.)`,
+        });
       }
     }, ms);
     t.unref();
@@ -610,7 +645,19 @@ export class CallManager {
         rec.transcript.push(this.turn("agent", text));
         this.notify(rec);
       },
-      onAskAgent: (request) => {
+      onAskAgent: (request): DeliveredNote | null => {
+        // Don't bother the agent twice for the same thing.
+        const same = rec.agentRequests.find((r) => similarRequests(r.request, request));
+        if (same?.status === "answered" && same.answer) {
+          rec.transcript.push(this.turn("system", `Reused earlier answer for: ${request}`));
+          return answerNote(same.request, same.answer);
+        }
+        if (same) {
+          return {
+            note: `"${same.request}" is still being worked on. Tell the user briefly that you're still on it.`,
+            after: `(Already told the user you're still working on "${same.request}".)`,
+          };
+        }
         const req: AgentRequest = {
           request_id: `req_${rec.agentRequests.length + 1}`,
           request,
@@ -623,6 +670,7 @@ export class CallManager {
         this.notify(rec);
         // If the agent doesn't answer (or estimate) in time, the voice model says so instead of leaving silence.
         this.armRequestTimer(rec, req, this.cfg.agentAnswerTimeoutSeconds * 1000);
+        return null;
       },
       onInterrupted: (heard) => {
         rec.transcript.push(this.turn("system", `User interrupted after: "${heard}"`));

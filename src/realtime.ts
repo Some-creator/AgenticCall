@@ -1,6 +1,6 @@
 import type { IncomingMessage, Server } from "node:http";
 import type { Duplex } from "node:stream";
-import Groq from "groq-sdk";
+import Groq, { InternalServerError, RateLimitError } from "groq-sdk";
 import { WebSocketServer, type WebSocket } from "ws";
 import type { Config } from "./config.js";
 import { log } from "./log.js";
@@ -50,32 +50,63 @@ const VOICE_TOOLS = [
   },
 ];
 
-export function groqLLM(apiKey: string, model: string): VoiceLLM {
-  const client = new Groq({ apiKey, maxRetries: 1 });
+/** Keep the system prompt plus the recent conversation, so long calls stay fast and under rate limits. */
+export function windowHistory(messages: ChatMessage[], max = 24): ChatMessage[] {
+  if (messages.length <= max + 1) return messages;
+  const rest = messages.slice(1);
+  let start = rest.length - max;
+  // Start at a user turn so a tool result is never separated from its tool call.
+  while (start < rest.length && rest[start].role !== "user") start++;
+  return [messages[0], ...rest.slice(start)];
+}
+
+export function groqLLM(apiKey: string, model: string, fallbackModel?: string): VoiceLLM {
+  // No automatic retries: on a rate limit, waiting out retry-after means dead air on the phone.
+  const client = new Groq({ apiKey, maxRetries: 0, timeout: 20_000 });
   // Reasoning models think before speaking; keep that minimal so the first word comes fast.
-  const reasoning = model.startsWith("openai/gpt-oss")
-    ? { reasoning_effort: "low" as const, include_reasoning: false }
-    : model.startsWith("qwen/")
-      ? { reasoning_effort: "none" as const }
-      : {};
+  const reasoningFor = (m: string) =>
+    m.startsWith("openai/gpt-oss")
+      ? { reasoning_effort: "low" as const, include_reasoning: false }
+      : m.startsWith("qwen/")
+        ? { reasoning_effort: "none" as const }
+        : {};
+  async function withFallback<T>(run: (m: string) => Promise<T>): Promise<T> {
+    try {
+      return await run(model);
+    } catch (err) {
+      const retryable = err instanceof RateLimitError || err instanceof InternalServerError;
+      if (!retryable || !fallbackModel || fallbackModel === model) throw err;
+      log.warn(`Groq ${model} failed (${(err as Error).message.slice(0, 120)}); using ${fallbackModel}`);
+      return run(fallbackModel);
+    }
+  }
   return {
     async *stream(messages, signal) {
-      const stream = await client.chat.completions.create(
-        {
-          model,
-          messages: messages as never,
-          stream: true,
-          max_completion_tokens: 400,
-          tools: VOICE_TOOLS,
-          tool_choice: "auto",
-          parallel_tool_calls: false,
-          ...reasoning,
-        },
-        { signal },
+      const t0 = Date.now();
+      const stream = await withFallback((m) =>
+        client.chat.completions.create(
+          {
+            model: m,
+            messages: windowHistory(messages) as never,
+            stream: true,
+            max_completion_tokens: 300,
+            tools: VOICE_TOOLS,
+            tool_choice: "auto",
+            parallel_tool_calls: false,
+            ...reasoningFor(m),
+          },
+          { signal },
+        ),
       );
       const calls = new Map<number, ToolCall>();
+      let first = true;
       for await (const chunk of stream) {
         const delta = chunk.choices[0]?.delta;
+        if (first && (delta?.content || delta?.tool_calls)) {
+          first = false;
+          const ms = Date.now() - t0;
+          if (ms > 2000) log.warn(`voice model slow to respond: ${ms}ms to first token`);
+        }
         if (delta?.content) yield { type: "text", text: delta.content };
         for (const tc of delta?.tool_calls ?? []) {
           const cur = calls.get(tc.index) ?? { id: "", type: "function" as const, function: { name: "", arguments: "" } };
@@ -88,12 +119,14 @@ export function groqLLM(apiKey: string, model: string): VoiceLLM {
       for (const call of calls.values()) yield { type: "tool_call", call };
     },
     async complete(messages) {
-      const res = await client.chat.completions.create({
-        model,
-        messages: messages as never,
-        max_completion_tokens: 800,
-        ...reasoning,
-      });
+      const res = await withFallback((m) =>
+        client.chat.completions.create({
+          model: m,
+          messages: messages as never,
+          max_completion_tokens: 800,
+          ...reasoningFor(m),
+        }),
+      );
       return res.choices[0]?.message?.content ?? "";
     },
   };
@@ -109,10 +142,35 @@ export interface SessionHooks {
   onUser(text: string): void;
   onAgent(text: string): void;
   onInterrupted(heard: string): void;
-  /** The voice model needs the calling agent: a question or command it can't handle itself. */
-  onAskAgent(request: string): void;
+  /**
+   * The voice model needs the calling agent: a question or command it can't handle itself.
+   * May return a note to deliver right away instead (e.g. an answer already given earlier in the call).
+   */
+  onAskAgent(request: string): DeliveredNote | null;
   /** The model said goodbye; the session will close shortly. */
   onWrapUp(): void;
+}
+
+/** Information handed to the voice model mid-call. `after` replaces it once it has been used ("" removes it). */
+export interface DeliveredNote {
+  note: string;
+  after: string;
+}
+
+export function answerNote(request: string, answer: string): DeliveredNote {
+  return {
+    note:
+      `Answer for the user's request "${request}": ${answer}\nShare it now, briefly and naturally (unless they asked ` +
+      "you to wait). If it's a question for the user, ask it, and pass their reply on with ask_agent.",
+    after:
+      `Earlier answer for "${request}": ${answer} (Already given to the user. Don't repeat it unless they ask again, ` +
+      "and don't look it up again.)",
+  };
+}
+
+/** Strip things text-to-speech would read badly: markdown, bullets, line breaks. */
+export function speakable(text: string): string {
+  return text.replace(/[*`#_~•]+/g, "").replace(/\s*\n+\s*/g, " ");
 }
 
 /** Rough time for TTS to finish speaking `text`, so we don't cut off the goodbye. */
@@ -133,6 +191,8 @@ export class RealtimeSession {
   private ending = false;
   private endTimer: NodeJS.Timeout | null = null;
   private fillerIdx = 0;
+  /** Notes delivered but not yet used in a reply. */
+  private freshNotes: { entry: ChatMessage; after: string }[] = [];
   private closed = false;
 
   /** True while a goodbye is being spoken and the session is about to close. */
@@ -200,11 +260,21 @@ export class RealtimeSession {
   }
 
   /** Hand the model new information (e.g. the agent's answer) and let it tell the caller. */
-  deliver(note: string): void {
+  deliver(n: DeliveredNote): void {
     if (this.ending || this.closed) return;
-    this.history.push({ role: "system", content: note });
+    const entry: ChatMessage = { role: "system", content: n.note };
+    this.history.push(entry);
+    this.freshNotes.push({ entry, after: n.after });
     if (this.inflight) this.respondAgain = true;
     else void this.respond();
+  }
+
+  /** Once a note has been acted on, stop it from prompting the model again (so "skip it" sticks). */
+  private retireNotes(notes: { entry: ChatMessage; after: string }[]): void {
+    for (const { entry, after } of notes) {
+      if (after) entry.content = after;
+      else this.removeEntry(entry);
+    }
   }
 
   /** Say an optional goodbye, then end the session once it has been spoken. */
@@ -217,6 +287,7 @@ export class RealtimeSession {
   private async respond(): Promise<void> {
     this.inflight?.abort();
     this.respondAgain = false;
+    const notes = this.freshNotes.splice(0);
     const ctrl = new AbortController();
     this.inflight = ctrl;
     const entry: { role: "assistant"; content: string; tool_calls?: ToolCall[] } = { role: "assistant", content: "" };
@@ -225,7 +296,8 @@ export class RealtimeSession {
     let spoken = "";
     let turnClosed = false; // sent last:true already
     const toolCalls: ToolCall[] = [];
-    const speak = (text: string) => {
+    const speak = (raw: string) => {
+      const text = speakable(raw);
       if (!text || turnClosed) return;
       spoken += text;
       entry.content = spoken;
@@ -244,7 +316,7 @@ export class RealtimeSession {
           continue;
         }
         if (turnClosed) continue; // drain the rest only to pick up tool calls
-        const out = filter.push(ev.text);
+        const out = speakable(filter.push(ev.text));
         // A question hands the turn to the caller: stop speaking there so the model can't answer for them.
         const q = out.indexOf("?");
         if (q >= 0) {
@@ -255,23 +327,31 @@ export class RealtimeSession {
         }
       }
       if (ctrl.signal.aborted) {
-        if (!spoken) this.removeEntry(entry);
+        if (!spoken) {
+          this.removeEntry(entry);
+          this.freshNotes.unshift(...notes); // nothing was said: still to be shared
+        } else {
+          this.retireNotes(notes); // they heard some of it and talked over it
+        }
         return;
       }
+      this.retireNotes(notes);
       if (!turnClosed) speak(filter.flush());
 
       const ask = toolCalls.find((c) => c.function.name === ASK_AGENT_TOOL);
+      let request = "";
       if (ask) {
+        try {
+          request = String(JSON.parse(ask.function.arguments || "{}").request ?? "").trim();
+        } catch {
+          request = ask.function.arguments.trim();
+        }
+      }
+      if (ask && request) {
         if (!spoken.trim()) speak(FILLERS[this.fillerIdx++ % FILLERS.length]);
         closeTurn();
         ask.id ||= `call_${Date.now()}`;
         entry.tool_calls = [ask];
-        let request = "";
-        try {
-          request = String(JSON.parse(ask.function.arguments || "{}").request ?? "");
-        } catch {
-          request = ask.function.arguments;
-        }
         this.history.push({
           role: "tool",
           tool_call_id: ask.id,
@@ -280,7 +360,8 @@ export class RealtimeSession {
             "talks to you, but never guess or make up the answer.",
         });
         if (spoken.trim()) this.hooks.onAgent(spoken.trim());
-        if (request.trim()) this.hooks.onAskAgent(request.trim());
+        const immediate = this.hooks.onAskAgent(request);
+        if (immediate) this.deliver(immediate);
         return;
       }
 
@@ -384,22 +465,33 @@ export function buildSystemPrompt(o: {
     `It is currently ${time} for them.`,
     "",
     "How to talk:",
-    "- This is a voice call. Everything you write is spoken aloud. Talk like a friendly, efficient person on the phone.",
-    "- Keep each turn to one or two short sentences. Use contractions. Never use lists, markdown, emoji, URLs or symbols.",
-    `- Write ONLY your own words for this one turn. Never write what ${o.userName} says, never continue the conversation for them, and never assume their answer.`,
-    "- If you ask a question, make it the last thing you say, then stop and wait for their reply.",
+    "- This is a live phone call; everything you write is spoken aloud. Sound like a friendly, sharp person on the phone.",
+    "- Keep turns short: one to three sentences. Plain words only: no lists, numbering, markdown, emoji, URLs or symbols.",
+    "- For instructions or anything with steps, give ONE step at a time, then wait for them to say they're ready for the next.",
+    `- Write ONLY your own words for this one turn. Never write what ${o.userName} says or assume their answer.`,
+    "- If you ask a question, make it the last thing you say, then stop.",
+    "- Don't tack \"anything else?\" onto every reply. Only ask it when the conversation seems to be wrapping up.",
+    "- If they say stop, skip, never mind, or change the subject, drop it immediately and don't bring it back unless they ask.",
+    "- If they ask you to wait, hold on or be quiet (for example while they mute), say only \"Sure, take your time.\" and",
+    "  then say nothing until they speak again. Hold any new answers until they're back.",
     "- Speech-to-text can mishear. If something sounds odd, briefly check what they meant.",
-    "- You have a back office (the ask_agent tool) with their email, calendar, files and accounts, which can also take actions.",
-    "  Whenever they ask something not covered by what you know, or ask you to do anything (send, schedule, look up, change,",
-    "  remind), call ask_agent right away with their full request. Say a short natural line first, like \"One sec, let me check.\"",
-    "- To them you are one assistant. Never mention a back office, another agent, or passing things along.",
-    "- While waiting for an answer, keep chatting normally if they talk. Never guess or invent an answer.",
-    "- When an answer arrives (as a system message), tell them right away in a sentence or two, then ask if they need anything else.",
-    "- Only state facts from what you know or from those answers.",
+    "- Casual opinions are fine. If asked what you think, give a brief, balanced take; on money topics add a quick \"not financial advice\".",
+    "",
+    "Your back office (the ask_agent tool) has their email, calendar, files, accounts and the web, and can take actions:",
+    "- Use it for anything you don't already know, anything current (news, prices, weather), and anything they ask you to do.",
+    "- Say a short natural line first, like \"One sec, let me check.\" Then call it with their full request and all details.",
+    "- Never ask it again for something already answered in this call; reuse that answer. If they ask how it's going, say you're still on it.",
+    "- To them you're one assistant: never mention a back office, another agent, or passing things along.",
+    "- While waiting, keep chatting normally if they talk. Never guess or invent an answer.",
+    "- When an answer arrives (as a system message), share it right away in a sentence or two, unless they asked you to wait.",
+    "- Only state facts from what you were told or from those answers.",
+    "",
+    "About this phone line, if they ask: it runs on a cloud server, so their computer doesn't need to be on; their agent can call them whenever something needs them.",
+    "",
+    "Ending the call:",
     "- Before ending, confirm any decision or request back to them in one sentence.",
-    `- Never end the call on your own initiative. If ${o.userName} sounds finished but hasn't said goodbye, ask something like "Anything else before I let you go?" and wait.`,
-    `- Only after they say goodbye, or clearly say there's nothing else, reply with a short goodbye (no question) and put ${END_MARKER} at the very end.`,
-    `- If they ask to hang up or say goodbye, say a short goodbye and end with ${END_MARKER}.`,
+    `- Never end on your own initiative. If they sound done but haven't said goodbye, ask "Anything else before I let you go?"`,
+    `- Only after they say goodbye or clearly say there's nothing else, say a short goodbye (no question) and put ${END_MARKER} at the very end.`,
   ]
     .filter(Boolean)
     .join("\n");
