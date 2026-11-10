@@ -25,7 +25,9 @@ const fakeLLM: VoiceLLM = {
   async *stream(messages, signal) {
     llmCalls.push(messages.map((m) => ({ ...m })));
     const last = messages.at(-1)!.content.toLowerCase();
-    const tokens = last.includes("bye")
+    const tokens = last.includes("chat")
+      ? ["Happy to! ", "Anything ", "else you'd like to test?", "No, ", "that's all. Goodbye! [END_CALL]"]
+      : last.includes("bye")
       ? ["Okay, ", "talk soon!", " [END", "_CA", "LL]"]
       : last.includes("story")
         ? ["Once ", "upon ", "a ", "time ", "there ", "was ", "a ", "very ", "long ", "story."]
@@ -197,6 +199,10 @@ test("real-time call: natural streamed conversation, interruption, goodbye and o
 
   tw.send({ type: "prompt", voicePrompt: "Yeah, 2pm works.", last: true });
   assert.equal(await tw.reply(), "Sure, I'll move it to 2pm. Anything else?");
+
+  // The model must not answer its own question for the user (and must not hang up on that basis).
+  tw.send({ type: "prompt", voicePrompt: "Let's chat a bit", last: true });
+  assert.equal(await tw.reply(), "Happy to! Anything else you'd like to test?");
   // The model saw the briefing and goal in its system prompt.
   assert.match(llmCalls[0][0].content, /Free slots: 2pm or 4:30pm/);
   assert.match(llmCalls[0][0].content, /Get a yes or no on 2pm/);
@@ -226,7 +232,7 @@ test("real-time call: natural streamed conversation, interruption, goodbye and o
   assert.deepEqual(out.outcome.user_decisions, ["Move meeting to 2pm"]);
   assert.deepEqual(
     out.transcript.filter((t: any) => t.role === "user").map((t: any) => t.text),
-    ["Yeah, 2pm works.", "Tell me a story", "Never mind. Bye!"],
+    ["Yeah, 2pm works.", "Let's chat a bit", "Tell me a story", "Never mind. Bye!"],
   );
   tw.ws.close();
   await client.close();

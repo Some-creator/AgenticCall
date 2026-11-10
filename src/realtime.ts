@@ -145,18 +145,29 @@ export class RealtimeSession {
     const filter = new MarkerFilter(END_MARKER);
     let spoken = "";
     try {
+      let askedQuestion = false;
       for await (const token of this.llm.stream(this.history, ctrl.signal)) {
         if (ctrl.signal.aborted) return;
-        const out = filter.push(token);
+        let out = filter.push(token);
+        // A question hands the turn to the caller: stop there so the model can't answer for them.
+        const q = out.indexOf("?");
+        if (q >= 0) {
+          out = out.slice(0, q + 1);
+          askedQuestion = true;
+        }
         if (out) {
           if (!spoken) this.history.push(entry);
           spoken += out;
           entry.content = spoken;
           this.send({ type: "text", token: out, last: false });
         }
+        if (askedQuestion) {
+          ctrl.abort();
+          break;
+        }
       }
-      if (ctrl.signal.aborted) return;
-      const tail = filter.flush();
+      if (ctrl.signal.aborted && !askedQuestion) return;
+      const tail = askedQuestion ? "" : filter.flush();
       if (tail) {
         if (!spoken) this.history.push(entry);
         spoken += tail;
@@ -164,7 +175,7 @@ export class RealtimeSession {
       }
       this.send({ type: "text", token: tail, last: true });
       if (spoken.trim()) this.hooks.onAgent(spoken.trim());
-      if (filter.found) this.wrapUp(spoken);
+      if (filter.found && !askedQuestion) this.wrapUp(spoken);
     } catch (err) {
       if (ctrl.signal.aborted) return;
       log.error(`voice model failed: ${(err as Error).message}`);
@@ -251,11 +262,13 @@ export function buildSystemPrompt(o: {
     "How to talk:",
     "- This is a voice call. Everything you write is spoken aloud. Talk like a friendly, efficient person on the phone.",
     "- Keep each turn to one or two short sentences. Use contractions. Never use lists, markdown, emoji, URLs or symbols.",
+    `- Write ONLY your own words for this one turn. Never write what ${o.userName} says, never continue the conversation for them, and never assume their answer.`,
+    "- If you ask a question, make it the last thing you say, then stop and wait for their reply.",
     "- Speech-to-text can mishear. If something sounds odd, briefly check what they meant.",
     "- Only state facts from the briefing. If asked something you don't know, say you'll pass it on and follow up; never make things up.",
     "- You can't take actions during the call. Note what they want done; their agent will do it after you hang up.",
     "- Before ending, confirm any decision or request back to them in one sentence.",
-    `- When the conversation is finished and you've said goodbye, put ${END_MARKER} at the very end of that last reply.`,
+    `- Only end the call after ${o.userName} has clearly said they're done (or said goodbye). Then say a short goodbye with no question, and put ${END_MARKER} at the very end.`,
     `- If they ask to hang up or say goodbye, say a short goodbye and end with ${END_MARKER}.`,
   ]
     .filter(Boolean)
