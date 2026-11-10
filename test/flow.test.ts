@@ -54,6 +54,9 @@ before(async () => {
     maxCallsPerHour: 6,
     quietHours: null,
     timezone: "America/New_York",
+    defaultMode: "turn_by_turn",
+    groq: { apiKey: null, model: "test" },
+    relay: {},
   };
   const calls = new CallManager(cfg, fakeTel);
   const app = createApp(cfg, calls);

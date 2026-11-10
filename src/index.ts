@@ -4,6 +4,7 @@ import { loadConfig } from "./config.js";
 import { CallManager, twilioTelephony } from "./calls.js";
 import { buildMcpServer } from "./tools.js";
 import { createApp } from "./app.js";
+import { attachRelayServer, groqLLM } from "./realtime.js";
 import { log } from "./log.js";
 
 async function main() {
@@ -15,10 +16,19 @@ async function main() {
     );
   }
 
-  const calls = new CallManager(cfg, twilioTelephony(cfg));
+  const llm = cfg.groq.apiKey ? groqLLM(cfg.groq.apiKey, cfg.groq.model) : undefined;
+  const calls = new CallManager(cfg, twilioTelephony(cfg), { llm });
   const app = createApp(cfg, calls);
-  await new Promise<void>((resolve) => app.listen(cfg.port, cfg.host, () => resolve()));
+  const server = await new Promise<import("node:http").Server>((resolve) => {
+    const s = app.listen(cfg.port, cfg.host, () => resolve(s));
+  });
+  attachRelayServer(server, calls);
   log.info(`Twilio webhooks at ${cfg.publicBaseUrl}/twilio/* (listening on ${cfg.host}:${cfg.port})`);
+  log.info(
+    cfg.defaultMode === "realtime"
+      ? `Real-time voice: Groq ${cfg.groq.model}`
+      : "Turn-by-turn voice (set GROQ_API_KEY for real-time conversations)",
+  );
 
   if (cfg.transport === "stdio") {
     await buildMcpServer(calls).connect(new StdioServerTransport());

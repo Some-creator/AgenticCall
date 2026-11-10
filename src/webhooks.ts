@@ -41,6 +41,7 @@ export function twilioRouter(cfg: Config, calls: CallManager): express.Router {
 
   r.post("/voice", (req, res) => xml(res, calls.onAnswered(cid(req), body(req))));
   r.post("/gather", (req, res) => xml(res, calls.onGather(cid(req), body(req))));
+  r.post("/relay-done", (req, res) => xml(res, calls.onRelayDone(cid(req), body(req))));
   r.post("/hold", async (req, res) => xml(res, await calls.onHold(cid(req))));
   r.post("/status", (req, res) => {
     calls.onStatus(cid(req), body(req));

@@ -16,6 +16,19 @@ speaks, hears what you say back, and responds, all on the same call.
  end_call("Great, bye!")                     ──►  <Say> + <Hangup>
 ```
 
+## Two ways to talk
+
+| | **Real-time** (recommended) | **Turn-by-turn** |
+|---|---|---|
+| Who talks to you | A fast voice model on this server (Groq, free tier), briefed by your agent | Your agent (Muse / Duet) itself, one turn at a time |
+| Feel | Natural: replies in about a second, and you can interrupt it | 2–4 second pause every turn, covered by "Mm-hm" |
+| What the agent gets | A summary, your decisions, follow-ups and the transcript once you hang up | Each thing you say, as you say it |
+| Needs | `GROQ_API_KEY` (free at console.groq.com) | Nothing extra |
+
+Real-time mode uses Twilio's ConversationRelay, which streams speech recognition and text-to-speech.
+Twilio charges for it per minute, on top of normal call minutes. If it fails to start on your account,
+the server automatically switches that call to turn-by-turn.
+
 ## Features
 
 - **Two-way voice.** Twilio speech recognition turns your words into text for the agent, and neural
@@ -183,6 +196,8 @@ All options are listed in [`.env.example`](.env.example). The main ones:
 | `TWILIO_VOICE` | `Polly.Joanna-Neural` | Any voice Twilio `<Say>` supports. |
 | `ANSWERING_MACHINE_DETECTION` | `true` | Uses Twilio AMD; adds a few seconds before the greeting. |
 | `SPEECH_TIMEOUT_SECONDS` | `8` | Silence before the "are you still there?" re-prompt. |
+| `GROQ_API_KEY` / `GROQ_MODEL` | unset / `openai/gpt-oss-120b` | Turns on real-time mode. Any Groq chat model ID works. |
+| `CALL_MODE` | `realtime` if a Groq key is set | `realtime` or `turn_by_turn`. Agents can also choose per call. |
 | `SPEECH_END_TIMEOUT` | `auto` | How long you must pause before your turn ends. Try `1` for faster turns; too low cuts you off mid-sentence. |
 | `ACK_PHRASES` | `Mm-hm.\|Okay.\|Hmm.\|Right.` | Played right after you speak to cover the agent's thinking time. Set it empty to disable. |
 | `MAX_HOLD_SECONDS` | `120` | Hangs up politely if the agent stops responding. |

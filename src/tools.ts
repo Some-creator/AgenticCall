@@ -4,6 +4,12 @@ import { CallError, type CallManager } from "./calls.js";
 
 const INSTRUCTIONS = `AgenticCall lets you phone your user and talk with them by voice.
 
+Real-time mode (the default when the server has it): a fast voice assistant runs the whole conversation for
+you, naturally, like a person. Give call_user a clear opening message, a briefing with every fact the user may
+ask about, and the goal (what you need decided or learned). Then call wait_for_reply until the call ends; you
+get a summary, the user's decisions and follow-ups, and the transcript. Act on them afterwards.
+Turn-by-turn mode: you answer each turn yourself, as described below.
+
 When to call: only for things that genuinely need the user's attention soon — urgent or time-sensitive
 tasks, important notifications, decisions you are blocked on, security alerts. For routine updates use
 send_sms (or don't contact them). Respect a refused call (quiet hours / rate limit): it means "text instead".
@@ -58,8 +64,9 @@ export function buildMcpServer(calls: CallManager): McpServer {
     {
       title: "Phone the user",
       description:
-        "Place a phone call to the user, speak an opening message, and listen for their spoken reply. " +
-        "Use for important or time-sensitive tasks, alerts and decisions only. Returns call_id and what the user said.",
+        "Phone the user and talk with them by voice. Use for important or time-sensitive tasks, alerts and decisions only. " +
+        "In realtime mode a voice assistant holds the conversation using your briefing and returns the outcome; " +
+        "in turn_by_turn mode it returns what the user said so you can reply with say_on_call.",
       inputSchema: {
         message: z
           .string()
@@ -76,14 +83,34 @@ export function buildMcpServer(calls: CallManager): McpServer {
           .optional()
           .describe('How to introduce yourself, e.g. "Muse" or "Claude". Defaults to "your AI assistant".'),
         urgency,
+        mode: z
+          .enum(["realtime", "turn_by_turn"])
+          .optional()
+          .describe(
+            "realtime: a fast voice assistant on the server holds a natural conversation and reports back. " +
+              "turn_by_turn: you hear and answer each turn yourself (slower). Defaults to the server's setting.",
+          ),
+        briefing: z
+          .string()
+          .max(6000)
+          .optional()
+          .describe(
+            "Realtime mode: everything the voice assistant may need to discuss — facts, options, deadlines, names, " +
+              "what you recommend. It only knows what you put here.",
+          ),
+        goal: z
+          .string()
+          .max(500)
+          .optional()
+          .describe('Realtime mode: what the call must achieve, e.g. "Get a yes/no on moving the meeting to 2pm".'),
         wait_for_reply: z.boolean().default(true).describe("Wait for the user to answer and reply before returning."),
         timeout_seconds: timeout,
       },
       annotations: { destructiveHint: false, openWorldHint: true },
     },
-    async ({ message, reason, caller_name, urgency, wait_for_reply, timeout_seconds }) =>
+    async ({ message, reason, caller_name, urgency, mode, briefing, goal, wait_for_reply, timeout_seconds }) =>
       guard(async () => {
-        const rec = await calls.startCall({ message, reason, urgency, callerName: caller_name });
+        const rec = await calls.startCall({ message, reason, urgency, callerName: caller_name, mode, briefing, goal });
         if (!wait_for_reply) {
           return { call_id: rec.id, status: rec.status, hint: "Dialing. Use wait_for_reply to hear the user." };
         }
@@ -115,7 +142,8 @@ export function buildMcpServer(calls: CallManager): McpServer {
     {
       title: "Keep listening",
       description:
-        "Keep waiting for the user to answer the phone or finish speaking. Use when a previous result had still_waiting=true.",
+        "Keep waiting. Realtime calls: returns when the call ends, with summary, decisions, follow-ups and transcript. " +
+        "Turn-by-turn calls: returns the user's next reply. Use whenever a result had still_waiting=true.",
       inputSchema: { call_id: callId, timeout_seconds: timeout },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },

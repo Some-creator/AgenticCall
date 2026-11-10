@@ -39,6 +39,15 @@ QUIET_HOURS=22:00-07:00
 Generate `MCP_AUTH_TOKEN` with `openssl rand -hex 32`. Any password manager's 40+ character random
 string also works. Phone numbers are in E.164 format (`+` then the country code).
 
+**For natural, real-time conversations** (strongly recommended), also add:
+
+```env
+GROQ_API_KEY=gsk_your_free_groq_key
+```
+
+Get the key for free at console.groq.com → API Keys (no card needed). Without it, calls still work,
+but your agent answers each turn itself, so there's a 2–4 second pause between turns.
+
 You **don't need `PUBLIC_BASE_URL`** on Railway. If it's unset, the server builds it from Railway's
 `RAILWAY_PUBLIC_DOMAIN` variable. If you later add a custom domain, set
 `PUBLIC_BASE_URL=https://your.custom.domain`.

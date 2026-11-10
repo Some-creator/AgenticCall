@@ -26,6 +26,16 @@ function int(name: string, fallback: number, min = 0, max = Number.MAX_SAFE_INTE
   return n;
 }
 
+function callMode(raw: string | undefined, hasGroq: boolean): "realtime" | "turn_by_turn" {
+  const v = raw?.trim().toLowerCase();
+  if (!v) return hasGroq ? "realtime" : "turn_by_turn";
+  if (v === "realtime" || v === "turn_by_turn") {
+    if (v === "realtime" && !hasGroq) throw new Error("CALL_MODE=realtime needs GROQ_API_KEY (free at console.groq.com)");
+    return v;
+  }
+  throw new Error(`CALL_MODE must be "realtime" or "turn_by_turn", got "${raw}"`);
+}
+
 function speechEnd(v: string): string {
   if (v === "auto" || /^\d+$/.test(v)) return v;
   throw new Error(`SPEECH_END_TIMEOUT must be "auto" or whole seconds, got "${v}"`);
@@ -73,6 +83,10 @@ export interface Config {
   maxCallsPerHour: number;
   quietHours: QuietHours | null;
   timezone: string;
+  /** "realtime": a fast voice model on this server runs the conversation. "turn_by_turn": the calling agent answers each turn. */
+  defaultMode: "realtime" | "turn_by_turn";
+  groq: { apiKey: string | null; model: string };
+  relay: { ttsProvider?: string; voice?: string; transcriptionProvider?: string; speechModel?: string };
 }
 
 export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
@@ -132,6 +146,17 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     maxCallsPerHour: int("MAX_CALLS_PER_HOUR", 6, 1, 1000),
     quietHours: parseQuietHours(process.env.QUIET_HOURS),
     timezone: optional("TIMEZONE", "America/New_York"),
+    defaultMode: callMode(process.env.CALL_MODE, Boolean(process.env.GROQ_API_KEY?.trim())),
+    groq: {
+      apiKey: process.env.GROQ_API_KEY?.trim() || null,
+      model: optional("GROQ_MODEL", "openai/gpt-oss-120b"),
+    },
+    relay: {
+      ttsProvider: process.env.RELAY_TTS_PROVIDER?.trim() || undefined,
+      voice: process.env.RELAY_VOICE?.trim() || undefined,
+      transcriptionProvider: process.env.RELAY_TRANSCRIPTION_PROVIDER?.trim() || undefined,
+      speechModel: process.env.RELAY_SPEECH_MODEL?.trim() || undefined,
+    },
   };
 }
 
