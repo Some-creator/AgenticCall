@@ -52,13 +52,20 @@ const VOICE_TOOLS = [
 ];
 
 /** Keep the system prompt plus the recent conversation, so long calls stay fast and under rate limits. */
-export function windowHistory(messages: ChatMessage[], max = 24): ChatMessage[] {
-  if (messages.length <= max + 1) return messages;
-  const rest = messages.slice(1);
-  let start = rest.length - max;
-  // Start at a user turn so a tool result is never separated from its tool call.
-  while (start < rest.length && rest[start].role !== "user") start++;
-  return [messages[0], ...rest.slice(start)];
+export function windowHistory(messages: ChatMessage[], max = 16): ChatMessage[] {
+  let out = messages;
+  if (messages.length > max + 1) {
+    const rest = messages.slice(1);
+    let start = rest.length - max;
+    // Start at a user turn so a tool result is never separated from its tool call.
+    while (start < rest.length && rest[start].role !== "user") start++;
+    out = [messages[0], ...rest.slice(start)];
+  }
+  // Older long messages (agent answers, long replies) are clipped; the latest few stay whole.
+  const keepWhole = out.length - 4;
+  return out.map((m, i) =>
+    i > 0 && i < keepWhole && m.content.length > 500 ? { ...m, content: `${m.content.slice(0, 500)}…` } : m,
+  );
 }
 
 export function groqLLM(apiKey: string, model: string, fallbackModel?: string): VoiceLLM {
@@ -257,6 +264,8 @@ export class RealtimeSession {
   /** Notes delivered but not yet used in a reply. */
   private freshNotes: { entry: ChatMessage; after: string }[] = [];
   private fillerTimer: NodeJS.Timeout | null = null;
+  /** Consecutive voice-model failures; the call is only given up after several in a row. */
+  private failures = 0;
   private closed = false;
 
   /** True while a goodbye is being spoken and the session is about to close. */
@@ -462,6 +471,7 @@ export class RealtimeSession {
         return;
       }
       this.retireNotes(notes);
+      this.failures = 0;
       const tail = speakable(brackets.push(filter.flush()) + brackets.flush());
       const unreleased: string = (pre ?? "") + tail;
       pre = null;
@@ -521,13 +531,30 @@ export class RealtimeSession {
       }
     } catch (err) {
       if (ctrl.signal.aborted) return;
-      log.error(`voice model failed: ${(err as Error).message}`);
-      const sorry = "Sorry, I'm having trouble on my end. I'll follow up by text.";
-      turnClosed = false;
-      speak(` ${sorry}`);
-      closeTurn();
-      this.hooks.onAgent(sorry);
-      this.wrapUp(sorry);
+      const status = (err as { status?: number }).status;
+      log.error(`voice model failed (${status ?? "no status"}): ${(err as Error).message.slice(0, 300)}`);
+      this.failures++;
+      this.freshNotes.unshift(...notes); // nothing was relayed: keep them for the retry
+      if (this.failures < 3) {
+        // Usually a rate limit or a blip: keep the call, cover the gap, and try again shortly.
+        if (!spoken.trim()) {
+          turnClosed = false;
+          speak("Sorry, one sec.");
+        }
+        closeTurn();
+        if (spoken.trim()) this.hooks.onAgent(spoken.trim());
+        setTimeout(() => {
+          if (!this.inflight && !this.ending && !this.closed) void this.respond();
+        }, 2500 * this.failures).unref();
+      } else {
+        const sorry = "Sorry, I'm having trouble on my end right now. I'll text you instead.";
+        turnClosed = false;
+        speak(` ${sorry}`);
+        closeTurn();
+        this.hooks.onAgent(sorry);
+        this.wrapUp(sorry);
+      }
+      return;
     } finally {
       if (this.inflight === ctrl) {
         this.inflight = null;

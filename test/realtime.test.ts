@@ -29,6 +29,7 @@ let base = "";
 const dialed: { url: string; statusCallback: string }[] = [];
 const llmCalls: ChatMessage[][] = [];
 const llmTools: (boolean | undefined)[] = [];
+let flakyFailed = false;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -70,6 +71,14 @@ const fakeLLM: VoiceLLM = {
       // Qwen-style: a fragment, then a broken tool call.
       yield { type: "text", text: "Got" };
       yield { type: "tool_call", call: { id: "tcx", type: "function", function: { name: "ask_agent", arguments: "{}" } } };
+      return;
+    }
+    if (lastMsg.role === "user" && last.includes("flaky") && !flakyFailed) {
+      flakyFailed = true;
+      throw Object.assign(new Error("rate limited"), { status: 429 });
+    }
+    if (messages.slice(-2).some((m) => m.content.toLowerCase().includes("flaky"))) {
+      yield { type: "text", text: "Okay, back. What were you saying?" };
       return;
     }
     if (lastMsg.role === "user" && last.includes("ramble")) {
@@ -499,6 +508,12 @@ test("natural turn-taking: no double greeting, no reply to 'okay', never hangs u
   // A rhetorical question mid-reply is not the end of the turn.
   tw.send({ type: "prompt", voicePrompt: "What should we talk about, honestly", last: true });
   assert.equal(await tw.reply(), "Honestly? I think we should talk about the new model.");
+
+  // A model error (e.g. rate limit) doesn't end the call: it covers the gap and retries.
+  tw.send({ type: "prompt", voicePrompt: "This is flaky", last: true });
+  assert.equal(await tw.reply(), "Sorry, one sec.");
+  assert.equal(await tw.reply(), "Okay, back. What were you saying?");
+  await assert.rejects(tw.next((m) => m.type === "end", 500));
 
   // A rambling reply is cut at a sentence boundary once it gets too long.
   tw.send({ type: "prompt", voicePrompt: "Go on, ramble", last: true });

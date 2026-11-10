@@ -547,11 +547,13 @@ export class CallManager {
     rec.transcript.push(this.turn("system", `Agent estimated ${human} for "${req.request}".${extra}`));
     rec.session.deliver({
       note: long
-        ? `"${req.request}" will take ${human}.${extra} Tell the user that, then ask whether they'd like to stay on ` +
+        ? `STATUS ONLY, NO ANSWER YET: "${req.request}" will take ${human}.${extra} You do NOT have the answer, so ` +
+          "don't give any of it or guess. Tell the user how long it'll take, then ask whether they'd like to stay on " +
           "the line or have you call them back when it's done. If they want a call back, confirm, say goodbye and " +
           `end the call with ${"[END_CALL]"}. If they stay, keep chatting until the answer arrives.`
-        : `"${req.request}" will take ${human}.${extra} Tell the user briefly (like "Give me about ${etaSeconds} ` +
-          'seconds"), then keep chatting normally if they talk.',
+        : `STATUS ONLY, NO ANSWER YET: "${req.request}" will take ${human}.${extra} You do NOT have the answer, so ` +
+          `don't give any of it or guess. Just tell the user briefly (like "Give me about ${etaSeconds} seconds"), ` +
+          "then keep chatting normally if they talk.",
       after: `(Already told the user "${req.request}" would take ${human}.)`,
     });
     // Restart the "no answer yet" timer from the estimate.
@@ -707,7 +709,9 @@ export class CallManager {
         }
         if (same) {
           return {
-            note: `"${same.request}" is still being worked on. Tell the user briefly that you're still on it.`,
+            note:
+              `STATUS ONLY, NO ANSWER YET: "${same.request}" is still being worked on. Tell the user briefly that ` +
+              "you're still on it. Don't guess the answer.",
             after: `(Already told the user you're still working on "${same.request}".)`,
           };
         }
