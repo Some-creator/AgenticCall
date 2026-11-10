@@ -290,10 +290,12 @@ test("real-time call: user asks something only the agent knows, mid-call", async
   assert.deepEqual(first.agent_requests, [{ request_id: "req_1", request: "What is on my calendar Friday?" }]);
   assert.equal(first.status, "in_progress");
 
-  // The agent answers; the voice model tells the user in its own words.
+  // The agent answers; the voice model tells the user in its own words. (say_on_call works too, for older clients.)
   await client.callTool({
-    name: "answer_on_call",
-    arguments: { call_id: first.call_id, request_id: "req_1", answer: "Friday: dentist at 10am." },
+    name: process.env.VIA_SAY ? "say_on_call" : "answer_on_call",
+    arguments: process.env.VIA_SAY
+      ? { call_id: first.call_id, message: "Friday: dentist at 10am." }
+      : { call_id: first.call_id, request_id: "req_1", answer: "Friday: dentist at 10am." },
   });
   assert.equal(await tw.reply(), "Friday you've got the dentist at 10. Anything else?");
   const sent = llmCalls.at(-1)!;

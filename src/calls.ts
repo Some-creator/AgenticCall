@@ -272,6 +272,26 @@ export class CallManager {
     const rec = this.mustGetLive(id);
     if (rec.mode === "realtime") {
       if (!rec.session) throw new CallError("The call hasn't connected yet. Try again once the user has picked up.");
+      // Agents with an older tool list answer mid-call requests with say_on_call: treat it as the answer.
+      const open = rec.agentRequests.filter((r) => r.status !== "answered");
+      if (open.length > 0) {
+        for (const r of open) {
+          r.status = "answered";
+          r.answer = message;
+          clearTimeout(rec.requestTimers.get(r.request_id));
+        }
+        rec.transcript.push(this.turn("system", `Agent answered "${open.map((r) => r.request).join("; ")}": ${message}`));
+        rec.session.deliver(
+          `Answer for the user's request "${open.map((r) => r.request).join("; ")}": ${message}\n` +
+            "Tell them now, briefly and naturally. If it's a question for the user, ask it, and pass their reply on with ask_agent.",
+        );
+        this.notify(rec);
+        return {
+          call_id: id,
+          status: rec.status,
+          hint: "Delivered as the answer. Call wait_for_reply to keep listening for more requests or the outcome.",
+        };
+      }
       rec.session.inject(message);
       return {
         call_id: id,
