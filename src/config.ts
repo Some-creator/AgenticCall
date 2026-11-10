@@ -17,11 +17,12 @@ function bool(name: string, fallback: boolean): boolean {
   return ["1", "true", "yes", "on"].includes(v);
 }
 
-function int(name: string, fallback: number): number {
+function int(name: string, fallback: number, min = 0, max = Number.MAX_SAFE_INTEGER): number {
   const v = process.env[name]?.trim();
   if (!v) return fallback;
-  const n = Number.parseInt(v, 10);
-  if (Number.isNaN(n)) throw new Error(`${name} must be an integer, got "${v}"`);
+  if (!/^\d+$/.test(v)) throw new Error(`${name} must be a whole number, got "${v}"`);
+  const n = Number(v);
+  if (n < min || n > max) throw new Error(`${name} must be between ${min} and ${max}, got ${n}`);
   return n;
 }
 
@@ -93,7 +94,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     userPhoneNumber: required("USER_PHONE_NUMBER"),
     userName: optional("USER_NAME", "there"),
     publicBaseUrl,
-    port: int("PORT", 3000),
+    port: int("PORT", 3000, 1, 65535),
     host: optional("HOST", "0.0.0.0"),
     transport,
     mcpAuthToken: process.env.MCP_AUTH_TOKEN?.trim() || null,
@@ -101,10 +102,10 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     voice: optional("TWILIO_VOICE", "Polly.Joanna-Neural"),
     language: optional("CALL_LANGUAGE", "en-US"),
     answeringMachineDetection: bool("ANSWERING_MACHINE_DETECTION", true),
-    speechTimeoutSeconds: int("SPEECH_TIMEOUT_SECONDS", 8),
-    maxHoldSeconds: int("MAX_HOLD_SECONDS", 120),
-    maxCallSeconds: int("MAX_CALL_SECONDS", 900),
-    maxCallsPerHour: int("MAX_CALLS_PER_HOUR", 6),
+    speechTimeoutSeconds: int("SPEECH_TIMEOUT_SECONDS", 8, 1, 60),
+    maxHoldSeconds: int("MAX_HOLD_SECONDS", 120, 10, 3600),
+    maxCallSeconds: int("MAX_CALL_SECONDS", 900, 30, 14400),
+    maxCallsPerHour: int("MAX_CALLS_PER_HOUR", 6, 1, 1000),
     quietHours: parseQuietHours(process.env.QUIET_HOURS),
     timezone: optional("TIMEZONE", "America/New_York"),
   };

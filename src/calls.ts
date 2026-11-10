@@ -70,7 +70,6 @@ export interface Telephony {
     url: string;
     statusCallback: string;
     machineDetection: boolean;
-    timeLimit: number;
   }): Promise<{ sid: string }>;
   hangup(sid: string): Promise<void>;
   sendSms(opts: { to: string; from: string; body: string }): Promise<{ sid: string }>;
@@ -88,7 +87,6 @@ export function twilioTelephony(cfg: Config): Telephony {
         statusCallback: o.statusCallback,
         statusCallbackMethod: "POST",
         statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
-        timeLimit: o.timeLimit,
         ...(o.machineDetection
           ? { machineDetection: "DetectMessageEnd", machineDetectionTimeout: 30 }
           : {}),
@@ -189,7 +187,6 @@ export class CallManager {
         url: `${this.cfg.publicBaseUrl}/twilio/voice?${q}`,
         statusCallback: `${this.cfg.publicBaseUrl}/twilio/status?${q}`,
         machineDetection: this.cfg.answeringMachineDetection,
-        timeLimit: this.cfg.maxCallSeconds,
       });
       rec.sid = sid;
       log.info(`call ${id} dialing (twilio sid ${sid}), urgency=${urgency}`);
@@ -333,6 +330,7 @@ export class CallManager {
     }
 
     this.setStatus(rec, "in_progress");
+    this.armMaxDuration(rec);
     return this.serveNextOrHold(rec);
   }
 
@@ -478,6 +476,18 @@ export class CallManager {
       log.warn(`SMS fallback failed: ${(e as Error).message}`);
     }
     this.notify(rec);
+  }
+
+  /** Hang up calls that run past MAX_CALL_SECONDS (enforced here instead of Twilio's TimeLimit). */
+  private armMaxDuration(rec: CallRecord) {
+    const timer = setTimeout(() => {
+      if (TERMINAL.has(rec.status)) return;
+      log.warn(`call ${rec.id} hit MAX_CALL_SECONDS (${this.cfg.maxCallSeconds}s); hanging up`);
+      rec.transcript.push(this.turn("system", "Maximum call length reached; hung up."));
+      if (rec.sid) void this.tel.hangup(rec.sid).catch((e) => log.warn(`hangup failed: ${e.message}`));
+      this.setStatus(rec, "completed");
+    }, this.cfg.maxCallSeconds * 1000);
+    timer.unref();
   }
 
   private setStatus(rec: CallRecord, status: CallStatus) {
