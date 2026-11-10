@@ -212,6 +212,19 @@ export function userSaidGoodbye(text: string): boolean {
   );
 }
 
+/** The caller explicitly asked to end the call. */
+export function userAskedToEnd(text: string): boolean {
+  return /\b(end the call|hang up|you can go( now)?|gotta go|got to go|bye|goodbye|let'?s end it|that'?s all for now)\b/i.test(text);
+}
+
+function parseRequest(args: string): string {
+  try {
+    return String(JSON.parse(args || "{}").request ?? "").trim();
+  } catch {
+    return args.trim();
+  }
+}
+
 /** "No" / "not really" in reply to "anything else?" means the caller is done. */
 export function declinedMore(lastAssistant: string, lastUser: string): boolean {
   const askedIfDone = /\b(anything else|are we good|before I let you go|need anything|that it for now|all set)\b/i.test(lastAssistant);
@@ -357,11 +370,11 @@ export class RealtimeSession {
     this.inflight = ctrl;
     const entry: { role: "assistant"; content: string; tool_calls?: ToolCall[] } = { role: "assistant", content: "" };
     this.history.push(entry);
-    const filter = new MarkerFilter(END_MARKER);
-    const brackets = new BracketFilter();
+    let filter = new MarkerFilter(END_MARKER);
+    let brackets = new BracketFilter();
     let spoken = "";
     let turnClosed = false; // sent last:true already
-    const toolCalls: ToolCall[] = [];
+    let toolCalls: ToolCall[] = [];
     const speak = (raw: string) => {
       let text = speakable(raw);
       if (!text || turnClosed) return;
@@ -403,18 +416,43 @@ export class RealtimeSession {
       this.send({ type: "text", token: "", last: true });
     };
     try {
-      // Right after being handed an answer or update, the model must say it, not go off and ask again.
-      const tools = notes.length === 0;
-      for await (const ev of this.llm.stream(this.history.slice(0, -1), ctrl.signal, { tools })) {
-        if (ctrl.signal.aborted) break;
-        if (ev.type === "tool_call") {
-          toolCalls.push(ev.call);
-          continue;
+      // The first sentence is held until it's complete: some models start a sentence ("Got") and then switch to
+      // a broken tool call, which would leave the caller hearing a single word.
+      let pre: string | null = "";
+      const run = async (tools: boolean): Promise<boolean> => {
+        filter = new MarkerFilter(END_MARKER);
+        brackets = new BracketFilter();
+        toolCalls = [];
+        pre = "";
+        for await (const ev of this.llm.stream(this.history.slice(0, -1), ctrl.signal, { tools })) {
+          if (ctrl.signal.aborted) return false;
+          if (ev.type === "tool_call") {
+            toolCalls.push(ev.call);
+            continue;
+          }
+          if (turnClosed) continue; // drain the rest only to pick up tool calls
+          const text = speakable(brackets.push(filter.push(ev.text)));
+          if (pre !== null) {
+            pre += text;
+            if (!/[.!?]/.test(pre) && pre.length < 60) continue;
+            const first = pre;
+            pre = null;
+            emit(first);
+          } else {
+            emit(text);
+          }
         }
-        if (turnClosed) continue; // drain the rest only to pick up tool calls
-        emit(speakable(brackets.push(filter.push(ev.text))));
+        return !ctrl.signal.aborted;
+      };
+      // Right after being handed an answer or update, the model must say it, not go off and ask again.
+      let ok = await run(notes.length === 0);
+      const validAsk = () =>
+        toolCalls.some((c) => c.function.name === ASK_AGENT_TOOL && parseRequest(c.function.arguments));
+      if (ok && !spoken && toolCalls.length > 0 && !validAsk()) {
+        log.warn(`voice model made an unusable tool call (${JSON.stringify(toolCalls).slice(0, 200)}); retrying without tools`);
+        ok = await run(false);
       }
-      if (ctrl.signal.aborted) {
+      if (!ok || ctrl.signal.aborted) {
         if (!spoken) {
           this.removeEntry(entry);
           this.freshNotes.unshift(...notes); // nothing was said: still to be shared
@@ -424,19 +462,19 @@ export class RealtimeSession {
         return;
       }
       this.retireNotes(notes);
-      if (!turnClosed) emit(speakable(brackets.push(filter.flush()) + brackets.flush()));
+      const tail = speakable(brackets.push(filter.flush()) + brackets.flush());
+      const unreleased: string = (pre ?? "") + tail;
+      pre = null;
+      // A fragment followed by a real hand-off ("Let me" + ask_agent) is replaced by a proper filler line.
+      if (!(validAsk() && !spoken && !/[.!?]\s*$/.test(unreleased))) {
+        if (!turnClosed) emit(unreleased);
+      }
       if (held !== null && !turnClosed && afterQuestion(held, true) !== "cut") speak(held);
       held = null;
 
       const ask = toolCalls.find((c) => c.function.name === ASK_AGENT_TOOL);
       let request = "";
-      if (ask) {
-        try {
-          request = String(JSON.parse(ask.function.arguments || "{}").request ?? "").trim();
-        } catch {
-          request = ask.function.arguments.trim();
-        }
-      }
+      if (ask) request = parseRequest(ask.function.arguments);
       if (ask && request) {
         if (!spoken.trim()) speak(FILLERS[this.fillerIdx++ % FILLERS.length]);
         closeTurn();
@@ -467,9 +505,16 @@ export class RealtimeSession {
           .reverse()
           .find((m) => m.role === "assistant" && m.content)?.content ?? "";
       const done = userSaidGoodbye(lastUser) || declinedMore(prevAssistant, lastUser);
-      // Hang up only when the caller signalled they're done, and the reply is a goodbye (marker or not:
-      // some models never emit the marker). Never hang up on a question.
-      if (spoken.trim() && !spoken.includes("?") && done && (filter.found || soundsLikeGoodbye(spoken))) {
+      const askedToEnd = userAskedToEnd(lastUser);
+      // Hang up when the caller asked to, or when they signalled they're done and the reply is a goodbye
+      // (marker or not: some models never emit it). Never hang up on a question.
+      if (!spoken.includes("?") && (askedToEnd || (done && spoken.trim() && (filter.found || soundsLikeGoodbye(spoken))))) {
+        if (!spoken.trim()) {
+          turnClosed = false;
+          speak("Alright, talk soon!");
+          closeTurn();
+          this.hooks.onAgent("Alright, talk soon!");
+        }
         this.wrapUp(spoken);
       } else if (filter.found) {
         log.warn(`ignored end-of-call from the voice model; caller hadn't said goodbye ("${lastUser}")`);
@@ -631,6 +676,10 @@ export function buildSystemPrompt(o: {
     "- Never write stage directions or notes like [No response needed]. If nothing needs saying, reply with nothing at all.",
     "- If they ask you to wait, hold on or be quiet, say only \"Sure, take your time.\" and stay silent until they speak.",
     "- Speech-to-text can mishear. If something sounds odd, briefly check what they meant.",
+    "- If they want to practice something (a mock interview, a quiz, a pitch), YOU play the other side: ask one",
+    "  question, then let them answer. Don't answer it for them. After they finish, give a short, honest bit of",
+    "  feedback and ask the next question. Their answers and stories are practice, not requests for you to act on.",
+    "- \"That's it\" or \"done\" after they tell you something usually just means they finished talking.",
     "- Casual opinions are fine. If asked what you think, give a real but balanced take; on money add a quick \"not financial advice\".",
     "- If they ask what you can do, suggest things you can actually do for them right now: check their calendar or email,",
     "  look something up, book or draft something. Not generic chatbot topics.",

@@ -62,6 +62,16 @@ const fakeLLM: VoiceLLM = {
       for (const t of ["Okay, I'll look into flights ", "after the call. [END_CALL]"]) yield { type: "text", text: t };
       return;
     }
+    if (lastMsg.role === "user" && (last.includes("let me think") || last.includes("no. end the call"))) {
+      if (opts?.tools === false) {
+        yield { type: "text", text: last.includes("think") ? "Got it, take your time." : "Got it." };
+        return;
+      }
+      // Qwen-style: a fragment, then a broken tool call.
+      yield { type: "text", text: "Got" };
+      yield { type: "tool_call", call: { id: "tcx", type: "function", function: { name: "ask_agent", arguments: "{}" } } };
+      return;
+    }
     if (lastMsg.role === "user" && last.includes("ramble")) {
       for (let i = 0; i < 20; i++) yield { type: "text", text: `This is sentence number ${i} of a very long answer. ` };
       return;
@@ -94,7 +104,7 @@ const fakeLLM: VoiceLLM = {
       : last.includes("bye")
         ? ["Okay, ", "talk soon!", " [END", "_CA", "LL]"]
         : last.includes("story")
-          ? ["Once ", "upon ", "a ", "time ", "there ", "was ", "a ", "very ", "long ", "story."]
+          ? ["Once upon a time. ", "There ", "was ", "a ", "very ", "long ", "story ", "that ", "went ", "on."]
           : ["Sure, ", "I'll move it ", "to 2pm. ", "Anything else?"];
     for (const t of tokens) {
       if (signal.aborted) return;
@@ -495,9 +505,14 @@ test("natural turn-taking: no double greeting, no reply to 'okay', never hangs u
   const long = await tw.reply();
   assert.ok(long.length < 420 && long.trim().endsWith("."), long);
 
+  // A fragment followed by a broken tool call is retried, so the caller hears a whole sentence.
+  tw.send({ type: "prompt", voicePrompt: "Hmm, let me think", last: true });
+  assert.equal(await tw.reply(), "Got it, take your time.");
+
   // The caller asks to end the call; the model says goodbye without the marker: still hangs up.
-  tw.send({ type: "prompt", voicePrompt: "Okay, end the call.", last: true });
-  assert.equal(await tw.reply(), "Alright, ending the call now. Take care.");
+  // Exactly what happened live: "No. End the call." -> "Got" + broken tool call. Now: a full reply, then hang up.
+  tw.send({ type: "prompt", voicePrompt: "No. End the call.", last: true });
+  assert.equal(await tw.reply(), "Got it.");
   await tw.next((m) => m.type === "end", 6000);
 
   await twilioPost(statusCallback, { CallStatus: "completed" });
