@@ -212,6 +212,13 @@ export function userSaidGoodbye(text: string): boolean {
   );
 }
 
+/** "No" / "not really" in reply to "anything else?" means the caller is done. */
+export function declinedMore(lastAssistant: string, lastUser: string): boolean {
+  const askedIfDone = /\b(anything else|are we good|before I let you go|need anything|that it for now|all set)\b/i.test(lastAssistant);
+  const saidNo = /^\s*(no|nope|nah|not really|not right now|i think that'?s it|all good|we'?re good|i'?m good|nothing)\b/i.test(lastUser);
+  return askedIfDone && saidNo;
+}
+
 function isOpenQuestion(text: string): boolean {
   return /\?\W*$/.test(text.trim()) && /\b(what|where|when|who|how|which|anything)\b/i.test(text);
 }
@@ -453,7 +460,13 @@ export class RealtimeSession {
       else this.removeEntry(entry);
       const lastUser =
         [...this.history].reverse().find((m) => m.role === "user" && !m.content.startsWith(NOTE_PREFIX))?.content ?? "";
-      const done = userSaidGoodbye(lastUser);
+      // The assistant line before this reply (what the caller was responding to).
+      const prevAssistant =
+        this.history
+          .slice(0, this.history.lastIndexOf(entry))
+          .reverse()
+          .find((m) => m.role === "assistant" && m.content)?.content ?? "";
+      const done = userSaidGoodbye(lastUser) || declinedMore(prevAssistant, lastUser);
       // Hang up only when the caller signalled they're done, and the reply is a goodbye (marker or not:
       // some models never emit the marker). Never hang up on a question.
       if (spoken.trim() && !spoken.includes("?") && done && (filter.found || soundsLikeGoodbye(spoken))) {

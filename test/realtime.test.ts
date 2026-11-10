@@ -253,11 +253,14 @@ test("after-question judgement", async () => {
   assert.equal(afterQuestion(" I", true), "continue");
 });
 
-test("filler and goodbye detection", () => {
+test("filler and goodbye detection", async () => {
   for (const t of ["Okay.", "alright", "Hmm...", "Mm-hmm", "Uh huh."]) assert.ok(isFiller(t), t);
   for (const t of ["Yes.", "Okay, book it", "No breaking news?"]) assert.ok(!isFiller(t), t);
   for (const t of ["No, bye!", "That's all", "I'm good, thanks", "Just call me back."]) assert.ok(userSaidGoodbye(t), t);
   for (const t of ["Could you check flights to Utah?", "Okay.", "Good question"]) assert.ok(!userSaidGoodbye(t), t);
+  const { declinedMore } = await import("../src/realtime.js");
+  assert.ok(declinedMore("Anything else I can handle, or are we good?", "Not really."));
+  assert.ok(!declinedMore("Want me to book the flights?", "No."));
 });
 
 test("marker filter hides the end marker even when split across tokens", () => {
