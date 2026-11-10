@@ -79,9 +79,18 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
   if (!process.env.PUBLIC_BASE_URL?.trim() && railwayDomain) {
     process.env.PUBLIC_BASE_URL = `https://${railwayDomain.replace(/^https?:\/\//, "")}`;
   }
-  const publicBaseUrl = required("PUBLIC_BASE_URL").replace(/\/+$/, "");
-  if (!/^https?:\/\//.test(publicBaseUrl)) {
-    throw new Error("PUBLIC_BASE_URL must start with https:// (Twilio needs to reach it)");
+  const rawBase = required("PUBLIC_BASE_URL");
+  let parsed: URL;
+  try {
+    parsed = new URL(/^https?:\/\//i.test(rawBase) ? rawBase : `https://${rawBase}`);
+  } catch {
+    throw new Error(`PUBLIC_BASE_URL is not a valid URL: "${rawBase}"`);
+  }
+  // Webhooks are always served from the root (/twilio/...), so keep only scheme + host.
+  // This tolerates values like "https://host/mcp" or "host.up.railway.app".
+  const publicBaseUrl = parsed.origin;
+  if (publicBaseUrl !== rawBase.replace(/\/+$/, "")) {
+    console.error(`WARN  PUBLIC_BASE_URL "${rawBase}" normalised to "${publicBaseUrl}"`);
   }
 
   return {
