@@ -599,6 +599,11 @@ export class CallManager {
     return rec;
   }
 
+  /** Calls that haven't ended yet. */
+  activeCount(): number {
+    return [...this.calls.values()].filter((c) => !TERMINAL.has(c.status)).length;
+  }
+
   list(): CallRecord[] {
     return [...this.calls.values()].sort((a, b) => b.createdAt - a.createdAt);
   }

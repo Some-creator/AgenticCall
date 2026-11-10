@@ -31,6 +31,23 @@ async function main() {
       : "Turn-by-turn voice (set GROQ_API_KEY for real-time conversations)",
   );
 
+  // On a redeploy, the platform sends SIGTERM. Don't drop a call that's in progress: keep this instance
+  // running until active calls end (up to the max call length), then exit.
+  let stopping = false;
+  const shutdown = async (signal: string) => {
+    if (stopping) return;
+    stopping = true;
+    const deadline = Date.now() + cfg.maxCallSeconds * 1000;
+    if (calls.activeCount() > 0) {
+      log.warn(`${signal}: waiting for ${calls.activeCount()} active call(s) to finish before shutting down`);
+    }
+    while (calls.activeCount() > 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 1000));
+    log.info(`${signal}: shutting down`);
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+
   if (cfg.transport === "stdio") {
     await buildMcpServer(calls).connect(new StdioServerTransport());
     log.info("MCP server running on stdio");
