@@ -14,6 +14,7 @@ When a result contains agent_requests, the user just asked something only you ca
 email, look at the calendar, send a message, ...). They are on the phone waiting, so handle it IMMEDIATELY
 with your own tools, then call answer_on_call with a short spoken-style answer (or what you did), then go
 back to wait_for_reply. Speed matters more than polish here.
+- Do the work DURING the call. Never answer "I'll do it after the call" unless the user asked for a call back.
 - If it will take more than ~10 seconds, FIRST call acknowledge_request with an honest eta_seconds, then do
   the work. For long tasks the user is offered a call back; if the call ends before you answer, the result
   lists open_requests: finish them and call_user back (or send_sms) with the result.

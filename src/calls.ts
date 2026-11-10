@@ -244,7 +244,10 @@ export class CallManager {
 
     const id = randomUUID();
     const who = input.callerName?.trim() || "your AI assistant";
-    const opening = `Hi ${this.cfg.userName}, this is ${who}. ${input.message}`;
+    // Don't stack a second greeting on a message that already says hi.
+    const name = this.cfg.userName && this.cfg.userName !== "there" ? ` ${this.cfg.userName}` : "";
+    const greets = /^\s*(hi|hey|hello|yo|good (morning|afternoon|evening))\b|^\s*it'?s \w+/i.test(input.message);
+    const opening = greets ? input.message.trim() : `Hi${name}, it's ${who}. ${input.message.trim()}`;
     const rec: CallRecord = {
       id,
       reason: input.reason,
@@ -647,7 +650,8 @@ export class CallManager {
       },
       onAskAgent: (request): DeliveredNote | null => {
         // Don't bother the agent twice for the same thing.
-        const same = rec.agentRequests.find((r) => similarRequests(r.request, request));
+        const wantsFresh = /\b(again|latest|update|newer|more|recheck|refresh|other)\b/i.test(request);
+        const same = wantsFresh ? undefined : rec.agentRequests.find((r) => similarRequests(r.request, request));
         if (same?.status === "answered" && same.answer) {
           rec.transcript.push(this.turn("system", `Reused earlier answer for: ${request}`));
           return answerNote(same.request, same.answer);

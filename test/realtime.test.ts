@@ -13,6 +13,8 @@ import {
   attachRelayServer,
   MarkerFilter,
   speakable,
+  isFiller,
+  userSaidGoodbye,
   windowHistory,
   type ChatMessage,
   type LLMEvent,
@@ -26,13 +28,15 @@ let server: Server;
 let base = "";
 const dialed: { url: string; statusCallback: string }[] = [];
 const llmCalls: ChatMessage[][] = [];
+const llmTools: (boolean | undefined)[] = [];
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // Replies like a voice model would, streaming tokens. Splits the end marker across tokens on purpose.
 const fakeLLM: VoiceLLM = {
-  async *stream(messages, signal): AsyncIterable<LLMEvent> {
+  async *stream(messages, signal, opts): AsyncIterable<LLMEvent> {
     llmCalls.push(messages.map((m) => ({ ...m })));
+    llmTools.push(opts?.tools);
     const lastMsg = messages.at(-1)!;
     const last = lastMsg.content.toLowerCase();
     if (lastMsg.role === "system" && last.includes("dentist")) {
@@ -52,6 +56,14 @@ const fakeLLM: VoiceLLM = {
         type: "tool_call",
         call: { id: "tc2", type: "function", function: { name: "ask_agent", arguments: '{"request":"Prepare my tax summary"}' } },
       };
+      return;
+    }
+    if (lastMsg.role === "user" && last.includes("flights")) {
+      for (const t of ["Okay, I'll look into flights ", "after the call. [END_CALL]"]) yield { type: "text", text: t };
+      return;
+    }
+    if (lastMsg.role === "user" && last.includes("what's up")) {
+      yield { type: "text", text: "Not much. What do you want to get into?" };
       return;
     }
     if (lastMsg.role === "user" && last.includes("hold on")) {
@@ -214,6 +226,13 @@ test("speech cleanup, request matching and history window", () => {
   assert.ok(w.length <= 11);
 });
 
+test("filler and goodbye detection", () => {
+  for (const t of ["Okay.", "alright", "Hmm...", "Mm-hmm", "Uh huh."]) assert.ok(isFiller(t), t);
+  for (const t of ["Yes.", "Okay, book it", "No breaking news?"]) assert.ok(!isFiller(t), t);
+  for (const t of ["No, bye!", "That's all", "I'm good, thanks", "Just call me back."]) assert.ok(userSaidGoodbye(t), t);
+  for (const t of ["Could you check flights to Utah?", "Okay.", "Good question"]) assert.ok(!userSaidGoodbye(t), t);
+});
+
 test("marker filter hides the end marker even when split across tokens", () => {
   const f = new MarkerFilter("[END_CALL]");
   const out = ["Bye", " now! [EN", "D_C", "ALL]", " ignored"].map((t) => f.push(t)).join("") + f.flush();
@@ -240,7 +259,7 @@ test("real-time call: natural streamed conversation, interruption, goodbye and o
 
   const twiml = (await twilioPost(url, { CallStatus: "in-progress", AnsweredBy: "human" })).body;
   assert.match(twiml, /<Connect action="[^"]*\/twilio\/relay-done\?cid=/);
-  assert.equal(attr(twiml, "welcomeGreeting"), "Hi Sam, this is Muse. Your 3pm with Dana needs to move. Is 2pm okay?");
+  assert.equal(attr(twiml, "welcomeGreeting"), "Hi Sam, it's Muse. Your 3pm with Dana needs to move. Is 2pm okay?");
   const relayUrl = attr(twiml, "url");
   assert.match(relayUrl, /^ws:\/\/127\.0\.0\.1:\d+\/twilio\/relay\?cid=/);
 
@@ -324,6 +343,7 @@ test("real-time call: user asks something only the agent knows, mid-call", async
       : { call_id: first.call_id, request_id: "req_1", answer: "Friday: dentist at 10am." },
   });
   assert.equal(await tw.reply(), "Friday you've got the dentist at 10. Anything else?");
+  assert.equal(llmTools.at(-1), false); // answering, not re-asking
   const sent = llmCalls.at(-1)!;
   assert.equal(sent.at(-1)!.role, "system");
   assert.equal((sent.at(-2) as any).role, "tool");
@@ -396,6 +416,33 @@ test("long request: agent estimates, user picks a call back, result lists open r
   );
   assert.deepEqual(done.open_requests, [{ request_id: reqId, request: "Prepare my tax summary", eta_seconds: 300 }]);
   assert.match(done.hint, /call_user/);
+  tw.ws.close();
+  await client.close();
+});
+
+test("natural turn-taking: no double greeting, no reply to 'okay', never hangs up unasked", async () => {
+  const client = await mcp();
+  const n = dialed.length;
+  const callP = client.callTool({ name: "call_user", arguments: { message: "Hey, it's Claude again.", timeout_seconds: 15 } });
+  while (dialed.length <= n) await sleep(10);
+  const { url, statusCallback } = dialed.at(-1)!;
+  const twiml = (await twilioPost(url, { CallStatus: "in-progress", AnsweredBy: "human" })).body;
+  assert.equal(attr(twiml, "welcomeGreeting"), "Hey, it's Claude again.");
+  const tw = await relay(attr(twiml, "url"));
+  tw.send({ type: "setup", callSid: `CA${dialed.length}`, customParameters: { cid: param(twiml, "cid"), secret: param(twiml, "secret") } });
+
+  tw.send({ type: "prompt", voicePrompt: "Hey, what's up", last: true });
+  assert.equal(await tw.reply(), "Not much. What do you want to get into?");
+  // "Okay." right after an open question means "let me think": stay quiet.
+  tw.send({ type: "prompt", voicePrompt: "Okay.", last: true });
+  await assert.rejects(tw.next((m) => m.type === "text", 1500));
+  // The model tries to hang up although the caller never said goodbye: the server refuses.
+  tw.send({ type: "prompt", voicePrompt: "Could you check flights to Utah?", last: true });
+  assert.equal(await tw.reply(), "Okay, I'll look into flights after the call. ");
+  await assert.rejects(tw.next((m) => m.type === "end", 3000));
+
+  await twilioPost(statusCallback, { CallStatus: "completed" });
+  await callP;
   tw.ws.close();
   await client.close();
 });

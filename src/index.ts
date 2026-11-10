@@ -4,7 +4,7 @@ import { loadConfig } from "./config.js";
 import { CallManager, twilioTelephony } from "./calls.js";
 import { buildMcpServer } from "./tools.js";
 import { createApp } from "./app.js";
-import { attachRelayServer, groqLLM } from "./realtime.js";
+import { attachRelayServer, groqLLM, logGroqModels } from "./realtime.js";
 import { log } from "./log.js";
 
 async function main() {
@@ -23,6 +23,7 @@ async function main() {
     const s = app.listen(cfg.port, cfg.host, () => resolve(s));
   });
   attachRelayServer(server, calls);
+  if (cfg.groq.apiKey) void logGroqModels(cfg.groq.apiKey);
   log.info(`Twilio webhooks at ${cfg.publicBaseUrl}/twilio/* (listening on ${cfg.host}:${cfg.port})`);
   log.info(
     cfg.defaultMode === "realtime"

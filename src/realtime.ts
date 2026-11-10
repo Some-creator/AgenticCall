@@ -22,7 +22,8 @@ export type LLMEvent = { type: "text"; text: string } | { type: "tool_call"; cal
 
 /** The fast model that holds the live conversation. A seam so tests can run without network access. */
 export interface VoiceLLM {
-  stream(messages: ChatMessage[], signal: AbortSignal): AsyncIterable<LLMEvent>;
+  /** With tools=false the model must answer in words (used right after it was handed new information). */
+  stream(messages: ChatMessage[], signal: AbortSignal, opts?: { tools?: boolean }): AsyncIterable<LLMEvent>;
   complete(messages: ChatMessage[]): Promise<string>;
 }
 
@@ -81,7 +82,7 @@ export function groqLLM(apiKey: string, model: string, fallbackModel?: string): 
     }
   }
   return {
-    async *stream(messages, signal) {
+    async *stream(messages, signal, opts) {
       const t0 = Date.now();
       const stream = await withFallback((m) =>
         client.chat.completions.create(
@@ -91,7 +92,7 @@ export function groqLLM(apiKey: string, model: string, fallbackModel?: string): 
             stream: true,
             max_completion_tokens: 300,
             tools: VOICE_TOOLS,
-            tool_choice: "auto",
+            tool_choice: opts?.tools === false ? "none" : "auto",
             parallel_tool_calls: false,
             ...reasoningFor(m),
           },
@@ -170,7 +171,26 @@ export function answerNote(request: string, answer: string): DeliveredNote {
 
 /** Strip things text-to-speech would read badly: markdown, bullets, line breaks. */
 export function speakable(text: string): string {
-  return text.replace(/[*`#_~•]+/g, "").replace(/\s*\n+\s*/g, " ");
+  return text
+    .replace(/[*`#_~•]+/g, "")
+    .replace(/\s*\n+\s*/g, " ")
+    .replace(/([.!?])([A-Z])/g, "$1 $2");
+}
+
+/** "Okay." / "Alright." / "Hmm." — sounds that mean "go on" or "let me think", not a new request. */
+export function isFiller(text: string): boolean {
+  return /^(ok(ay)?|alright|all right|hmm+|mm+[- ]?hmm*|uh[- ]?huh|um+|uh+|so+|well|let'?s see)[.!,…\s]*$/i.test(text.trim());
+}
+
+/** Did the caller actually signal they're done? The model may only hang up if so. */
+export function userSaidGoodbye(text: string): boolean {
+  return /\b(bye|goodbye|good night|that'?s (all|it)|nothing else|i'?m (good|done|all set)|we'?re (good|done)|hang up|end the call|talk (to you )?later|see (you|ya)|gotta go|got to go|call (me )?back|no,? thanks?)\b/i.test(
+    text,
+  );
+}
+
+function isOpenQuestion(text: string): boolean {
+  return /\?\W*$/.test(text.trim()) && /\b(what|where|when|who|how|which|anything)\b/i.test(text);
 }
 
 /** Rough time for TTS to finish speaking `text`, so we don't cut off the goodbye. */
@@ -193,6 +213,7 @@ export class RealtimeSession {
   private fillerIdx = 0;
   /** Notes delivered but not yet used in a reply. */
   private freshNotes: { entry: ChatMessage; after: string }[] = [];
+  private fillerTimer: NodeJS.Timeout | null = null;
   private closed = false;
 
   /** True while a goodbye is being spoken and the session is about to close. */
@@ -223,8 +244,21 @@ export class RealtimeSession {
         if (msg.last === false) return; // only act on the final transcript of a turn
         const text = String(msg.voicePrompt ?? "").trim();
         if (!text || this.ending) return;
+        if (this.fillerTimer) clearTimeout(this.fillerTimer);
+        this.fillerTimer = null;
         this.hooks.onUser(text);
         this.history.push({ role: "user", content: text });
+        // "Okay." after "What would you like to talk about?" means they're thinking: don't fire another question
+        // at them. Answer only if they don't continue within a few seconds.
+        const lastSaid = [...this.history].reverse().find((m) => m.role === "assistant")?.content ?? "";
+        if (isFiller(text) && isOpenQuestion(lastSaid) && this.freshNotes.length === 0) {
+          this.fillerTimer = setTimeout(() => {
+            this.fillerTimer = null;
+            void this.respond();
+          }, 4000);
+          this.fillerTimer.unref();
+          return;
+        }
         void this.respond();
         return;
       }
@@ -297,8 +331,9 @@ export class RealtimeSession {
     let turnClosed = false; // sent last:true already
     const toolCalls: ToolCall[] = [];
     const speak = (raw: string) => {
-      const text = speakable(raw);
+      let text = speakable(raw);
       if (!text || turnClosed) return;
+      if (/[.!?]$/.test(spoken) && /^[A-Z]/.test(text)) text = ` ${text}`;
       spoken += text;
       entry.content = spoken;
       this.send({ type: "text", token: text, last: false });
@@ -309,7 +344,9 @@ export class RealtimeSession {
       this.send({ type: "text", token: "", last: true });
     };
     try {
-      for await (const ev of this.llm.stream(this.history.slice(0, -1), ctrl.signal)) {
+      // Right after being handed an answer or update, the model must say it, not go off and ask again.
+      const tools = notes.length === 0;
+      for await (const ev of this.llm.stream(this.history.slice(0, -1), ctrl.signal, { tools })) {
         if (ctrl.signal.aborted) break;
         if (ev.type === "tool_call") {
           toolCalls.push(ev.call);
@@ -368,7 +405,12 @@ export class RealtimeSession {
       closeTurn();
       if (spoken.trim()) this.hooks.onAgent(spoken.trim());
       else this.removeEntry(entry);
-      if (filter.found && spoken.trim() && !spoken.includes("?")) this.wrapUp(spoken);
+      if (filter.found && spoken.trim() && !spoken.includes("?")) {
+        const lastUser = [...this.history].reverse().find((m) => m.role === "user")?.content ?? "";
+        // Never hang up on the caller unless they actually signalled they're done.
+        if (userSaidGoodbye(lastUser)) this.wrapUp(spoken);
+        else log.warn(`ignored end-of-call from the voice model; caller hadn't said goodbye ("${lastUser}")`);
+      }
     } catch (err) {
       if (ctrl.signal.aborted) return;
       log.error(`voice model failed: ${(err as Error).message}`);
@@ -445,6 +487,17 @@ export class MarkerFilter {
 
 // ---------------------------------------------------------------- prompt
 
+/** Best effort: log which models the Groq key can use, to help pick GROQ_MODEL. */
+export async function logGroqModels(apiKey: string): Promise<void> {
+  try {
+    const list = await new Groq({ apiKey, maxRetries: 0, timeout: 10_000 }).models.list();
+    const ids = list.data.map((m) => m.id).sort();
+    log.info(`Groq models available to your key: ${ids.join(", ")}`);
+  } catch (e) {
+    log.warn(`couldn't list Groq models: ${(e as Error).message}`);
+  }
+}
+
 export function buildSystemPrompt(o: {
   callerName: string;
   userName: string;
@@ -464,33 +517,47 @@ export function buildSystemPrompt(o: {
     o.goal ? `What this call needs to achieve: ${o.goal}` : "",
     `It is currently ${time} for them.`,
     "",
-    "How to talk:",
-    "- This is a live phone call; everything you write is spoken aloud. Sound like a friendly, sharp person on the phone.",
-    "- Keep turns short: one to three sentences. Plain words only: no lists, numbering, markdown, emoji, URLs or symbols.",
-    "- For instructions or anything with steps, give ONE step at a time, then wait for them to say they're ready for the next.",
-    `- Write ONLY your own words for this one turn. Never write what ${o.userName} says or assume their answer.`,
+    "How to talk (this matters most):",
+    "- This is a real phone call and everything you write is spoken aloud. Talk like a sharp, warm friend who happens to be",
+    "  a great assistant, not like a chatbot or customer-service script.",
+    "- React like a person first, then answer: \"Oh nice.\", \"Ugh, yeah.\", \"Got it.\", \"Hm, good question.\" Match their energy and slang.",
+    "- Short turns: usually one or two sentences. Use contractions and everyday words. Vary how you start sentences.",
+    "- Plain speech only: no lists, numbering, markdown, emoji, URLs or symbols. For steps, give ONE step, then wait.",
+    "- Never use these: \"Sure thing\", \"Certainly\", \"Absolutely\", \"Great question\", \"Here's a quick rundown\",",
+    "  \"I'd be happy to\", \"Is there anything else\", \"What would you like to explore/dive into/go over\", \"Let me know if\".",
+    "- Don't end replies with a question unless you really need an answer. Silence is fine; they'll talk when they're ready.",
+    `- Write ONLY your own words for this turn. Never write what ${o.userName} says or assume their answer.`,
     "- If you ask a question, make it the last thing you say, then stop.",
-    "- Don't tack \"anything else?\" onto every reply. Only ask it when the conversation seems to be wrapping up.",
-    "- If they say stop, skip, never mind, or change the subject, drop it immediately and don't bring it back unless they ask.",
-    "- If they ask you to wait, hold on or be quiet (for example while they mute), say only \"Sure, take your time.\" and",
-    "  then say nothing until they speak again. Hold any new answers until they're back.",
+    "- If they say stop, skip, never mind, or change the subject, drop it immediately and don't bring it back.",
+    "- If they ask you to wait, hold on or be quiet, say only \"Sure, take your time.\" and stay silent until they speak.",
     "- Speech-to-text can mishear. If something sounds odd, briefly check what they meant.",
-    "- Casual opinions are fine. If asked what you think, give a brief, balanced take; on money topics add a quick \"not financial advice\".",
+    "- Casual opinions are fine. If asked what you think, give a real but balanced take; on money add a quick \"not financial advice\".",
+    "- If they ask what you can do, suggest things you can actually do for them right now: check their calendar or email,",
+    "  look something up, book or draft something. Not generic chatbot topics.",
+    "- Never claim you checked something you didn't. If they ask for more or newer info, get it with ask_agent.",
+    "",
+    "Example of the right tone:",
+    "  User: ugh what's my day look like tomorrow",
+    "  You: One sec. ... Okay, pretty light. HackerRank at eleven, then gym at eight.",
+    "  User: wait what time's the gym again",
+    "  You: Eight, till ten.",
     "",
     "Your back office (the ask_agent tool) has their email, calendar, files, accounts and the web, and can take actions:",
-    "- Use it for anything you don't already know, anything current (news, prices, weather), and anything they ask you to do.",
-    "- Say a short natural line first, like \"One sec, let me check.\" Then call it with their full request and all details.",
-    "- Never ask it again for something already answered in this call; reuse that answer. If they ask how it's going, say you're still on it.",
+    "- Use it for anything you don't already know, anything current (news, prices, weather, flights), and anything they ask you to do.",
+    "- Say a short line first, like \"One sec.\" or \"Let me look.\", then call it with their full request and every detail they gave.",
+    "- Don't ask it again for something it already answered in this call, unless they want more or fresher info.",
     "- To them you're one assistant: never mention a back office, another agent, or passing things along.",
     "- While waiting, keep chatting normally if they talk. Never guess or invent an answer.",
-    "- When an answer arrives (as a system message), share it right away in a sentence or two, unless they asked you to wait.",
+    "- When an answer arrives (as a system message), just say it, in your own natural words. Don't say \"one sec\" or",
+    "  \"let me check\" again. If the answer asks them something, ask it. If it says something will happen after the call,",
+    "  tell them that plainly; it is NOT a reason to hang up.",
     "- Only state facts from what you were told or from those answers.",
     "",
     "About this phone line, if they ask: it runs on a cloud server, so their computer doesn't need to be on; their agent can call them whenever something needs them.",
     "",
     "Ending the call:",
     "- Before ending, confirm any decision or request back to them in one sentence.",
-    `- Never end on your own initiative. If they sound done but haven't said goodbye, ask "Anything else before I let you go?"`,
+    `- Never end on your own initiative. If they sound done but haven't said goodbye, ask something casual like "Anything else, or are we good?"`,
     `- Only after they say goodbye or clearly say there's nothing else, say a short goodbye (no question) and put ${END_MARKER} at the very end.`,
   ]
     .filter(Boolean)

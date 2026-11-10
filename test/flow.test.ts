@@ -121,7 +121,7 @@ test("full two-way conversation", async () => {
   await twilioPost(statusCallback, { CallStatus: "ringing" });
   const answered = await twilioPost(url, { CallStatus: "in-progress", AnsweredBy: "human" });
   assert.match(answered.body, /<Gather[^>]*input="speech"/);
-  assert.match(answered.body, /Hi Sam, this is Muse\. Your 3pm meeting moved to 2pm\. Should I accept\?/);
+  assert.match(answered.body, /Hi Sam, it's Muse\. Your 3pm meeting moved to 2pm\. Should I accept\?/);
 
   const afterSpeech = await twilioPost(urlFor("gather", statusCallback), { SpeechResult: "Yes, accept it.", Confidence: "0.93" });
   assert.match(afterSpeech.body, /<Say[^>]*>Mm-hm\.<\/Say><Redirect[^>]*>[^<]*\/twilio\/hold/);
