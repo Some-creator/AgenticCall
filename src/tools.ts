@@ -102,8 +102,9 @@ export function buildMcpServer(calls: CallManager): McpServer {
           .enum(["realtime", "turn_by_turn"])
           .optional()
           .describe(
-            "realtime: a fast voice assistant on the server holds a natural conversation and reports back. " +
-              "turn_by_turn: you hear and answer each turn yourself (slower). Defaults to the server's setting.",
+            "Leave this unset. The default (realtime) sounds natural and still sends you anything only you can " +
+              "handle, mid-call. Only use turn_by_turn if the user explicitly asks for it: it has a different, " +
+              "robotic voice and multi-second pauses on every turn.",
           ),
         briefing: z
           .string()
