@@ -39,11 +39,11 @@ const fakeLLM: VoiceLLM = {
     llmTools.push(opts?.tools);
     const lastMsg = messages.at(-1)!;
     const last = lastMsg.content.toLowerCase();
-    if (lastMsg.role === "system" && last.includes("dentist")) {
+    if (last.includes("back office") && last.includes("dentist")) {
       for (const t of ["Friday you've got ", "the dentist at 10. ", "Anything else?"]) yield { type: "text", text: t };
       return;
     }
-    if (lastMsg.role === "system" && last.includes("call them back when it's done")) {
+    if (last.includes("back office") && last.includes("call them back when it's done")) {
       for (const t of ["That'll take about 5 minutes. ", "Want to stay on, or should I call you back?"]) yield { type: "text", text: t };
       return;
     }
@@ -60,6 +60,14 @@ const fakeLLM: VoiceLLM = {
     }
     if (lastMsg.role === "user" && last.includes("flights")) {
       for (const t of ["Okay, I'll look into flights ", "after the call. [END_CALL]"]) yield { type: "text", text: t };
+      return;
+    }
+    if (lastMsg.role === "user" && last.includes("honestly")) {
+      for (const t of ["Honestly? ", "I think we should ", "talk about the new model."]) yield { type: "text", text: t };
+      return;
+    }
+    if (lastMsg.role === "user" && last.includes("end the call")) {
+      yield { type: "text", text: "Alright, ending the call now. Take care." };
       return;
     }
     if (lastMsg.role === "user" && last.includes("what's up")) {
@@ -226,6 +234,14 @@ test("speech cleanup, request matching and history window", () => {
   assert.ok(w.length <= 11);
 });
 
+test("after-question judgement", async () => {
+  const { afterQuestion } = await import("../src/realtime.js");
+  assert.equal(afterQuestion(" No, that's all."), "cut");
+  assert.equal(afterQuestion(" I think we should"), "continue");
+  assert.equal(afterQuestion(" I"), "wait");
+  assert.equal(afterQuestion(" I", true), "continue");
+});
+
 test("filler and goodbye detection", () => {
   for (const t of ["Okay.", "alright", "Hmm...", "Mm-hmm", "Uh huh."]) assert.ok(isFiller(t), t);
   for (const t of ["Yes.", "Okay, book it", "No breaking news?"]) assert.ok(!isFiller(t), t);
@@ -329,7 +345,7 @@ test("real-time call: user asks something only the agent knows, mid-call", async
 
   tw.send({ type: "prompt", voicePrompt: "What's on my calendar Friday?", last: true });
   // The voice model covers the gap naturally...
-  assert.equal(await tw.reply(), "One sec, let me check.");
+  assert.equal(await tw.reply(), "Let me check.");
   // ...and the agent's pending call_user returns right away with the request.
   const first = JSON.parse(((await callP) as any).content[0].text);
   assert.deepEqual(first.agent_requests, [{ request_id: "req_1", request: "What is on my calendar Friday?" }]);
@@ -345,7 +361,8 @@ test("real-time call: user asks something only the agent knows, mid-call", async
   assert.equal(await tw.reply(), "Friday you've got the dentist at 10. Anything else?");
   assert.equal(llmTools.at(-1), false); // answering, not re-asking
   const sent = llmCalls.at(-1)!;
-  assert.equal(sent.at(-1)!.role, "system");
+  assert.equal(sent.at(-1)!.role, "user");
+  assert.match(sent.at(-1)!.content, /^\[Update from your back office/);
   assert.equal((sent.at(-2) as any).role, "tool");
   assert.equal((sent.at(-3) as any).tool_calls[0].function.name, "ask_agent");
 
@@ -397,7 +414,7 @@ test("long request: agent estimates, user picks a call back, result lists open r
   tw.send({ type: "setup", callSid: `CA${dialed.length}`, customParameters: { cid: param(twiml, "cid"), secret: param(twiml, "secret") } });
 
   tw.send({ type: "prompt", voicePrompt: "Can you put together my taxes summary?", last: true });
-  assert.equal(await tw.reply(), "One sec, let me check.");
+  assert.equal(await tw.reply(), "Let me check.");
   const first = JSON.parse(((await callP) as any).content[0].text);
   const reqId = first.agent_requests[0].request_id;
 
@@ -440,6 +457,15 @@ test("natural turn-taking: no double greeting, no reply to 'okay', never hangs u
   tw.send({ type: "prompt", voicePrompt: "Could you check flights to Utah?", last: true });
   assert.equal(await tw.reply(), "Okay, I'll look into flights after the call. ");
   await assert.rejects(tw.next((m) => m.type === "end", 3000));
+
+  // A rhetorical question mid-reply is not the end of the turn.
+  tw.send({ type: "prompt", voicePrompt: "What should we talk about, honestly", last: true });
+  assert.equal(await tw.reply(), "Honestly? I think we should talk about the new model.");
+
+  // The caller asks to end the call; the model says goodbye without the marker: still hangs up.
+  tw.send({ type: "prompt", voicePrompt: "Okay, end the call.", last: true });
+  assert.equal(await tw.reply(), "Alright, ending the call now. Take care.");
+  await tw.next((m) => m.type === "end", 6000);
 
   await twilioPost(statusCallback, { CallStatus: "completed" });
   await callP;

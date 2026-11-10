@@ -630,6 +630,7 @@ export class CallManager {
 
     const llm = this.llm!;
     const system = buildSystemPrompt({
+      model: this.cfg.groq.model,
       callerName: rec.callerName,
       userName: this.cfg.userName,
       opening: rec.opening,

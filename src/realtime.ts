@@ -137,7 +137,26 @@ export function groqLLM(apiKey: string, model: string, fallbackModel?: string): 
 
 export const END_MARKER = "[END_CALL]";
 
-const FILLERS = ["One sec, let me check.", "Sure, one moment.", "Okay, checking now.", "Give me a second."];
+const FILLERS = ["Let me check.", "Give me a few seconds.", "Let me look that up.", "Hang on, checking now."];
+
+const NOTE_PREFIX = "[Update from your back office. The caller did NOT say this.]";
+
+/**
+ * After a "?" the model sometimes keeps going and answers for the caller ("Anything else? No, that's all.").
+ * Decide from the text after the question: cut (it's a fake reply), continue (a rhetorical "Honestly? I think…"),
+ * or wait for a few more characters.
+ */
+export function afterQuestion(rest: string, final = false): "cut" | "continue" | "wait" {
+  const t = rest.replace(/^[\s"'”’)\]]+/, "");
+  if (/^(yes|no|yeah|yep|nope|nah|sure|okay|ok|alright|that'?s|i'?m|we'?re|user|haider|me)\b/i.test(t)) return "cut";
+  if (!final && t.length < 14 && !/[.!?,;]/.test(t)) return "wait";
+  return "continue";
+}
+
+/** Does a reply sound like a goodbye? */
+function soundsLikeGoodbye(text: string): boolean {
+  return /\b(bye|goodbye|take care|talk (to you )?(soon|later)|see (you|ya)|have a good|ending the call|hanging up|catch you later)\b/i.test(text);
+}
 
 export interface SessionHooks {
   onUser(text: string): void;
@@ -297,7 +316,8 @@ export class RealtimeSession {
   /** Hand the model new information (e.g. the agent's answer) and let it tell the caller. */
   deliver(n: DeliveredNote): void {
     if (this.ending || this.closed) return;
-    const entry: ChatMessage = { role: "system", content: n.note };
+    // Delivered as a clearly labelled user-role message: some models ignore system messages mid-conversation.
+    const entry: ChatMessage = { role: "user", content: `${NOTE_PREFIX}\n${n.note}` };
     this.history.push(entry);
     this.freshNotes.push({ entry, after: n.after });
     if (this.inflight) this.respondAgain = true;
@@ -307,7 +327,7 @@ export class RealtimeSession {
   /** Once a note has been acted on, stop it from prompting the model again (so "skip it" sticks). */
   private retireNotes(notes: { entry: ChatMessage; after: string }[]): void {
     for (const { entry, after } of notes) {
-      if (after) entry.content = after;
+      if (after) entry.content = `${NOTE_PREFIX}\n${after}`;
       else this.removeEntry(entry);
     }
   }
@@ -339,6 +359,25 @@ export class RealtimeSession {
       entry.content = spoken;
       this.send({ type: "text", token: text, last: false });
     };
+    // Text after a "?" is held back until we know it isn't the model answering for the caller.
+    let held: string | null = null;
+    const emit = (text: string): void => {
+      if (turnClosed || !text) return;
+      if (held !== null) {
+        held += text;
+        const d = afterQuestion(held);
+        if (d === "wait") return;
+        const rest = held;
+        held = null;
+        if (d === "cut") return closeTurn();
+        return emit(rest);
+      }
+      const q = text.indexOf("?");
+      if (q < 0) return speak(text);
+      speak(text.slice(0, q + 1));
+      held = "";
+      emit(text.slice(q + 1));
+    };
     const closeTurn = () => {
       if (turnClosed) return;
       turnClosed = true;
@@ -354,15 +393,7 @@ export class RealtimeSession {
           continue;
         }
         if (turnClosed) continue; // drain the rest only to pick up tool calls
-        const out = speakable(filter.push(ev.text));
-        // A question hands the turn to the caller: stop speaking there so the model can't answer for them.
-        const q = out.indexOf("?");
-        if (q >= 0) {
-          speak(out.slice(0, q + 1));
-          closeTurn();
-        } else {
-          speak(out);
-        }
+        emit(speakable(filter.push(ev.text)));
       }
       if (ctrl.signal.aborted) {
         if (!spoken) {
@@ -374,7 +405,9 @@ export class RealtimeSession {
         return;
       }
       this.retireNotes(notes);
-      if (!turnClosed) speak(filter.flush());
+      if (!turnClosed) emit(speakable(filter.flush()));
+      if (held !== null && !turnClosed && afterQuestion(held, true) !== "cut") speak(held);
+      held = null;
 
       const ask = toolCalls.find((c) => c.function.name === ASK_AGENT_TOOL);
       let request = "";
@@ -406,11 +439,15 @@ export class RealtimeSession {
       closeTurn();
       if (spoken.trim()) this.hooks.onAgent(spoken.trim());
       else this.removeEntry(entry);
-      if (filter.found && spoken.trim() && !spoken.includes("?")) {
-        const lastUser = [...this.history].reverse().find((m) => m.role === "user")?.content ?? "";
-        // Never hang up on the caller unless they actually signalled they're done.
-        if (userSaidGoodbye(lastUser)) this.wrapUp(spoken);
-        else log.warn(`ignored end-of-call from the voice model; caller hadn't said goodbye ("${lastUser}")`);
+      const lastUser =
+        [...this.history].reverse().find((m) => m.role === "user" && !m.content.startsWith(NOTE_PREFIX))?.content ?? "";
+      const done = userSaidGoodbye(lastUser);
+      // Hang up only when the caller signalled they're done, and the reply is a goodbye (marker or not:
+      // some models never emit the marker). Never hang up on a question.
+      if (spoken.trim() && !spoken.includes("?") && done && (filter.found || soundsLikeGoodbye(spoken))) {
+        this.wrapUp(spoken);
+      } else if (filter.found) {
+        log.warn(`ignored end-of-call from the voice model; caller hadn't said goodbye ("${lastUser}")`);
       }
     } catch (err) {
       if (ctrl.signal.aborted) return;
@@ -500,6 +537,7 @@ export async function logGroqModels(apiKey: string): Promise<void> {
 }
 
 export function buildSystemPrompt(o: {
+  model?: string;
   callerName: string;
   userName: string;
   opening: string;
@@ -522,11 +560,13 @@ export function buildSystemPrompt(o: {
     "- This is a real phone call and everything you write is spoken aloud. Talk like a sharp, warm friend who happens to be",
     "  a great assistant, not like a chatbot or customer-service script.",
     "- React like a person first, then answer: \"Oh nice.\", \"Ugh, yeah.\", \"Got it.\", \"Hm, good question.\" Match their energy and slang.",
-    "- Short turns: usually one or two sentences. Use contractions and everyday words. Vary how you start sentences.",
+    "- Keep the conversation alive like a real person would. When it's your turn, actually say something: answer properly,",
+    "  add a thought or opinion, and keep the ball rolling. Two to four sentences is normal; one-word replies are not.",
+    "  Never stop halfway through a thought. Use contractions and everyday words, and vary how you start sentences.",
     "- Plain speech only: no lists, numbering, markdown, emoji, URLs or symbols. For steps, give ONE step, then wait.",
     "- Never use these: \"Sure thing\", \"Certainly\", \"Absolutely\", \"Great question\", \"Here's a quick rundown\",",
     "  \"I'd be happy to\", \"Is there anything else\", \"What would you like to explore/dive into/go over\", \"Let me know if\".",
-    "- Don't end replies with a question unless you really need an answer. Silence is fine; they'll talk when they're ready.",
+    "- Don't tack a stock question onto every reply, but a genuine follow-up question is great, like a friend would ask.",
     `- Write ONLY your own words for this turn. Never write what ${o.userName} says or assume their answer.`,
     "- If you ask a question, make it the last thing you say, then stop.",
     "- If they say stop, skip, never mind, or change the subject, drop it immediately and don't bring it back.",
@@ -539,22 +579,24 @@ export function buildSystemPrompt(o: {
     "",
     "Example of the right tone:",
     "  User: ugh what's my day look like tomorrow",
-    "  You: One sec. ... Okay, pretty light. HackerRank at eleven, then gym at eight.",
+    "  You: Let me check. ... Okay, pretty chill day actually. HackerRank at eleven, then gym at eight tonight.",
     "  User: wait what time's the gym again",
-    "  You: Eight, till ten.",
+    "  You: Eight, and it runs till ten. Leg day too, so good luck.",
     "",
     "Your back office (the ask_agent tool) has their email, calendar, files, accounts and the web, and can take actions:",
     "- Use it for anything you don't already know, anything current (news, prices, weather, flights), and anything they ask you to do.",
-    "- Say a short line first, like \"One sec.\" or \"Let me look.\", then call it with their full request and every detail they gave.",
+    "- Say a short natural line first, like \"Let me check.\" or \"Give me a few seconds.\", then call it with their full request.",
     "- Don't ask it again for something it already answered in this call, unless they want more or fresher info.",
     "- To them you're one assistant: never mention a back office, another agent, or passing things along.",
     "- While waiting, keep chatting normally if they talk. Never guess or invent an answer.",
-    "- When an answer arrives (as a system message), just say it, in your own natural words. Don't say \"one sec\" or",
-    "  \"let me check\" again. If the answer asks them something, ask it. If it says something will happen after the call,",
+    "- Answers arrive as messages starting with [Update from your back office...]. The caller didn't say those. As soon as",
+    "  one arrives, tell the caller what it says, in your own natural words. Never say you're still waiting once it's there.",
+    "  Don't say \"let me check\" again. If the answer asks them something, ask it. If it says something will happen after the call,",
     "  tell them that plainly; it is NOT a reason to hang up.",
     "- Only state facts from what you were told or from those answers.",
     "",
-    "About this phone line, if they ask: it runs on a cloud server, so their computer doesn't need to be on; their agent can call them whenever something needs them.",
+    "About this phone line, if they ask: it runs on a cloud server, so their computer doesn't need to be on; their agent can call them whenever something needs them." +
+      (o.model ? ` Your voice runs on the ${o.model} model on Groq (with a backup model if it's rate-limited).` : ""),
     "",
     "Ending the call:",
     "- Before ending, confirm any decision or request back to them in one sentence.",
