@@ -12,7 +12,8 @@
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "test": "tsx --test test/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test-call": "node scripts/test-call.mjs"
   },
   "engines": {
     "node": ">=18.18"

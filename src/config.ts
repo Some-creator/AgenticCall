@@ -73,6 +73,11 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     throw new Error(`MCP_TRANSPORT must be "http" or "stdio", got "${transport}"`);
   }
 
+  // On Railway, fall back to the service's generated domain if PUBLIC_BASE_URL isn't set.
+  const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN?.trim();
+  if (!process.env.PUBLIC_BASE_URL?.trim() && railwayDomain) {
+    process.env.PUBLIC_BASE_URL = `https://${railwayDomain.replace(/^https?:\/\//, "")}`;
+  }
   const publicBaseUrl = required("PUBLIC_BASE_URL").replace(/\/+$/, "");
   if (!/^https?:\/\//.test(publicBaseUrl)) {
     throw new Error("PUBLIC_BASE_URL must start with https:// (Twilio needs to reach it)");

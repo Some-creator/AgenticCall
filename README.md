@@ -76,7 +76,9 @@ openssl rand -hex 32
 Twilio has to reach your server over public HTTPS. Cloud agents like Muse and Duet run in the cloud,
 so they need a public URL too. A server on your laptop's localhost won't work for them.
 
-**Option A: deploy the Docker image (recommended).** Works on Render, Railway, Fly.io, a VPS, and so on.
+**Railway:** follow the step-by-step guide in [`docs/RAILWAY.md`](docs/RAILWAY.md).
+
+**Option A: deploy the Docker image.** Works on Render, Fly.io, a VPS, and so on.
 
 ```bash
 docker build -t agentic-call .
@@ -200,6 +202,12 @@ npm run dev
 The tests run a full simulated call with no network access. They drive signed Twilio webhooks and a
 real MCP client through answer → speech → agent reply → re-prompt on silence → hang-up, and they also
 cover voicemail with the SMS fallback, quiet hours and auth.
+
+To place a real call through a deployed server and play the agent from your terminal:
+
+```bash
+npm run test-call -- https://<your-host>/mcp <MCP_AUTH_TOKEN>
+```
 
 ### Notes and limits
 - Call state is kept in memory. Run a **single instance**, and calls in progress are lost on restart.
