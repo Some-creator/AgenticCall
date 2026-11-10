@@ -296,6 +296,11 @@ export class CallManager {
 
   /** Queue something to say. With listen=true the user's reply is awaited and returned. */
   async say(id: string, message: string, listen: boolean, timeoutMs: number): Promise<WaitResult> {
+    const prev = this.get(id);
+    if (TERMINAL.has(prev.status) && prev.mode === "realtime") {
+      const open = prev.agentRequests.filter((r) => r.status !== "answered");
+      if (open.length > 0) return this.callBack(prev, open, message);
+    }
     const rec = this.mustGetLive(id);
     if (rec.mode === "realtime") {
       if (!rec.session) throw new CallError("The call hasn't connected yet. Try again once the user has picked up.");
@@ -467,10 +472,13 @@ export class CallManager {
   }
 
   /** The agent's answer to a mid-call request: the voice model tells the user right away. */
-  answerRequest(id: string, requestId: string, answer: string): WaitResult {
-    const rec = this.mustGetLive(id);
-    const req = rec.agentRequests.find((r) => r.request_id === requestId);
+  async answerRequest(id: string, requestId: string, answer: string): Promise<WaitResult> {
+    const ended = this.get(id);
+    const req = ended.agentRequests.find((r) => r.request_id === requestId);
     if (!req) throw new CallError(`Unknown request_id ${requestId} on call ${id}`);
+    // They hung up before the answer was ready (e.g. they chose a call back): ring them back with it.
+    if (TERMINAL.has(ended.status)) return this.callBack(ended, [req], answer);
+    const rec = this.mustGetLive(id);
     if (!rec.session) throw new CallError("This call isn't in real-time mode; use say_on_call instead.");
     req.status = "answered";
     req.answer = answer;
@@ -483,6 +491,46 @@ export class CallManager {
       status: rec.status,
       hint: "Delivered; it's being spoken now. Call wait_for_reply to keep listening for more requests or the outcome.",
     };
+  }
+
+  /** An answer arrived after the user hung up: call them back with it (or text it if a call isn't allowed now). */
+  private async callBack(prev: CallRecord, reqs: AgentRequest[], answer: string): Promise<WaitResult> {
+    for (const r of reqs) {
+      r.status = "answered";
+      r.answer = answer;
+      clearTimeout(prev.requestTimers.get(r.request_id));
+    }
+    const about = reqs.map((r) => r.request).join("; ");
+    const name = this.cfg.userName && this.cfg.userName !== "there" ? ` ${this.cfg.userName}` : "";
+    try {
+      const call = await this.startCall({
+        message: `Hey${name}, it's ${prev.callerName}, calling back with what you asked for. ${answer}`,
+        reason: `Call back with the result of: ${about}`,
+        urgency: prev.urgency,
+        callerName: prev.callerName,
+        mode: this.llm ? "realtime" : "turn_by_turn",
+        briefing: `On the previous call they asked: ${about}\nThe result (already said in your opening): ${answer}`,
+        goal: "Give them the result and help with any follow-up questions.",
+      });
+      prev.transcript.push(this.turn("system", `Answer arrived after the call; calling back (call_id ${call.id}).`));
+      log.info(`call ${prev.id}: calling the user back with the answer (call ${call.id})`);
+      return {
+        call_id: call.id,
+        status: call.status,
+        hint:
+          `The user had already hung up, so I'm calling them back with this answer on a NEW call (call_id ${call.id}). ` +
+          "Use wait_for_reply with that call_id, and answer any new agent_requests on it.",
+      };
+    } catch (err) {
+      // Quiet hours, rate limit or another active call: text the result instead.
+      await this.sendSms(`[${prev.callerName}] ${answer}`).catch((e) => log.warn(`SMS failed: ${e.message}`));
+      prev.transcript.push(this.turn("system", `Answer arrived after the call; couldn't call back, texted it instead.`));
+      return {
+        call_id: prev.id,
+        status: prev.status,
+        hint: `The user had hung up and a call back wasn't possible (${(err as Error).message}), so the answer was texted to them.`,
+      };
+    }
   }
 
   /** The agent's quick estimate of how long a mid-call request will take. */

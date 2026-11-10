@@ -444,6 +444,20 @@ test("long request: agent estimates, user picks a call back, result lists open r
   );
   assert.deepEqual(done.open_requests, [{ request_id: reqId, request: "Prepare my tax summary", eta_seconds: 300 }]);
   assert.match(done.hint, /call_user/);
+
+  // The agent finishes after the user hung up: the server rings them back with the answer itself.
+  const before = dialed.length;
+  const cb = JSON.parse(
+    ((await client.callTool({
+      name: "answer_on_call",
+      arguments: { call_id: first.call_id, request_id: reqId, answer: "Your tax summary is ready: you owe about 1,200 dollars." },
+    })) as any).content[0].text,
+  );
+  assert.equal(dialed.length, before + 1);
+  assert.notEqual(cb.call_id, first.call_id);
+  const cbTwiml = (await twilioPost(dialed.at(-1)!.url, { CallStatus: "in-progress", AnsweredBy: "human" })).body;
+  assert.match(attr(cbTwiml, "welcomeGreeting"), /calling back with what you asked for\. Your tax summary is ready/);
+  await twilioPost(dialed.at(-1)!.statusCallback, { CallStatus: "completed" });
   tw.ws.close();
   await client.close();
 });
