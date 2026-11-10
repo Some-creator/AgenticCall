@@ -183,6 +183,8 @@ All options are listed in [`.env.example`](.env.example). The main ones:
 | `TWILIO_VOICE` | `Polly.Joanna-Neural` | Any voice Twilio `<Say>` supports. |
 | `ANSWERING_MACHINE_DETECTION` | `true` | Uses Twilio AMD; adds a few seconds before the greeting. |
 | `SPEECH_TIMEOUT_SECONDS` | `8` | Silence before the "are you still there?" re-prompt. |
+| `SPEECH_END_TIMEOUT` | `auto` | How long you must pause before your turn ends. Try `1` for faster turns; too low cuts you off mid-sentence. |
+| `ACK_PHRASES` | `Mm-hm.\|Okay.\|Hmm.\|Right.` | Played right after you speak to cover the agent's thinking time. Set it empty to disable. |
 | `MAX_HOLD_SECONDS` | `120` | Hangs up politely if the agent stops responding. |
 
 ## Development

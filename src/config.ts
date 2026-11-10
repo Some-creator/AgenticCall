@@ -26,6 +26,11 @@ function int(name: string, fallback: number, min = 0, max = Number.MAX_SAFE_INTE
   return n;
 }
 
+function speechEnd(v: string): string {
+  if (v === "auto" || /^\d+$/.test(v)) return v;
+  throw new Error(`SPEECH_END_TIMEOUT must be "auto" or whole seconds, got "${v}"`);
+}
+
 export interface QuietHours {
   /** minutes after midnight */
   start: number;
@@ -59,6 +64,10 @@ export interface Config {
   language: string;
   answeringMachineDetection: boolean;
   speechTimeoutSeconds: number;
+  /** Silence after speech before the turn ends: "auto" or whole seconds. */
+  speechEndTimeout: string;
+  speechModel: string;
+  ackPhrases: string[];
   maxHoldSeconds: number;
   maxCallSeconds: number;
   maxCallsPerHour: number;
@@ -112,6 +121,12 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     language: optional("CALL_LANGUAGE", "en-US"),
     answeringMachineDetection: bool("ANSWERING_MACHINE_DETECTION", true),
     speechTimeoutSeconds: int("SPEECH_TIMEOUT_SECONDS", 8, 1, 60),
+    speechEndTimeout: speechEnd(optional("SPEECH_END_TIMEOUT", "auto")),
+    speechModel: optional("SPEECH_MODEL", "phone_call"),
+    ackPhrases: (process.env.ACK_PHRASES ?? "Mm-hm.|Okay.|Hmm.|Right.")
+      .split("|")
+      .map((p) => p.trim())
+      .filter(Boolean),
     maxHoldSeconds: int("MAX_HOLD_SECONDS", 120, 10, 3600),
     maxCallSeconds: int("MAX_CALL_SECONDS", 900, 30, 14400),
     maxCallsPerHour: int("MAX_CALLS_PER_HOUR", 6, 1, 1000),

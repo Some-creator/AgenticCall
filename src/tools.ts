@@ -12,7 +12,9 @@ How a call works:
 1. call_user speaks your opening message and listens. It returns what the user said (user_said).
 2. Respond with say_on_call (listen=true) to keep talking. Every reply you send is spoken aloud by
    text-to-speech, so write short, natural spoken sentences: no markdown, lists, URLs or emoji.
-3. While you think, the user hears silence on hold, so respond quickly and keep turns brief.
+3. Every second you spend thinking is dead air on the phone. Reply IMMEDIATELY with one or two short
+   sentences, like a person on a call. Don't plan, research or use other tools between turns unless the
+   user asked you to; if you must, first say so ("Let me check that, one sec") with say_on_call listen=false.
 4. If a result has still_waiting=true, call wait_for_reply to keep listening.
 5. Finish with end_call and a one-line goodbye. Confirm any decision the user made before hanging up.`;
 

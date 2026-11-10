@@ -46,6 +46,9 @@ before(async () => {
     language: "en-US",
     answeringMachineDetection: true,
     speechTimeoutSeconds: 8,
+    speechEndTimeout: "auto",
+    speechModel: "phone_call",
+    ackPhrases: ["Mm-hm."],
     maxHoldSeconds: 120,
     maxCallSeconds: 900,
     maxCallsPerHour: 6,
@@ -116,7 +119,8 @@ test("full two-way conversation", async () => {
   assert.match(answered.body, /Hi Sam, this is Muse\. Your 3pm meeting moved to 2pm\. Should I accept\?/);
 
   const afterSpeech = await twilioPost(urlFor("gather", statusCallback), { SpeechResult: "Yes, accept it.", Confidence: "0.93" });
-  assert.match(afterSpeech.body, /<Redirect[^>]*>[^<]*\/twilio\/hold/);
+  assert.match(afterSpeech.body, /<Say[^>]*>Mm-hm\.<\/Say><Redirect[^>]*>[^<]*\/twilio\/hold/);
+  assert.doesNotMatch(afterSpeech.body, /<Pause/);
 
   const first = parse(await callP);
   assert.equal(first.user_said, "Yes, accept it.");

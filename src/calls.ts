@@ -57,6 +57,7 @@ interface CallRecord {
   replies: Reply[];
   silentStreak: number;
   holdingSince?: number;
+  lastAck?: string;
   smsFallbackSent: boolean;
   /** Wakes anyone waiting for a change on this call (agent-side reply waits, Twilio hold long-polls). */
   listeners: Set<() => void>;
@@ -345,7 +346,8 @@ export class CallManager {
       rec.transcript.push(this.turn("user", text));
       rec.replies.push({ kind: "speech", text, confidence: num(params.Confidence) });
       this.notify(rec);
-      return this.serveNextOrHold(rec);
+      if (rec.next) return this.serve(rec);
+      return this.ackThenHold(rec);
     }
 
     rec.silentStreak += 1;
@@ -438,22 +440,36 @@ export class CallManager {
       input: ["speech"],
       action: this.url("gather", rec),
       method: "POST",
-      speechTimeout: "auto",
+      speechTimeout: this.cfg.speechEndTimeout,
       timeout: this.cfg.speechTimeoutSeconds,
       actionOnEmptyResult: true,
       language: this.cfg.language as never,
-      speechModel: "phone_call",
-      enhanced: true,
+      speechModel: this.cfg.speechModel as never,
+      ...(this.cfg.speechModel === "phone_call" ? { enhanced: true } : {}),
     });
     // <Say> nested inside <Gather> lets the user interrupt (barge in).
     g.say(this.sayAttrs(), text);
     return vr.toString();
   }
 
+  /** A short "Mm-hm." while the agent thinks, so the gap doesn't sound like dead air. */
+  private ackThenHold(rec: CallRecord): string {
+    const phrases = this.cfg.ackPhrases;
+    if (phrases.length === 0) return this.holdTwiml(rec);
+    let pick = phrases[Math.floor(Math.random() * phrases.length)];
+    if (phrases.length > 1 && pick === rec.lastAck) pick = phrases[(phrases.indexOf(pick) + 1) % phrases.length];
+    rec.lastAck = pick;
+    rec.holdingSince ??= this.now();
+    const vr = new VoiceResponse();
+    vr.say(this.sayAttrs(), pick);
+    vr.redirect({ method: "POST" }, this.url("hold", rec));
+    return vr.toString();
+  }
+
   private holdTwiml(rec: CallRecord): string {
     rec.holdingSince ??= this.now();
     const vr = new VoiceResponse();
-    vr.pause({ length: 1 });
+    // No <Pause>: /hold long-polls, so the agent's reply is spoken the moment it arrives.
     vr.redirect({ method: "POST" }, this.url("hold", rec));
     return vr.toString();
   }
