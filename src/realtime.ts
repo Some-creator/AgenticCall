@@ -348,6 +348,7 @@ export class RealtimeSession {
     const entry: { role: "assistant"; content: string; tool_calls?: ToolCall[] } = { role: "assistant", content: "" };
     this.history.push(entry);
     const filter = new MarkerFilter(END_MARKER);
+    const brackets = new BracketFilter();
     let spoken = "";
     let turnClosed = false; // sent last:true already
     const toolCalls: ToolCall[] = [];
@@ -372,6 +373,14 @@ export class RealtimeSession {
         if (d === "cut") return closeTurn();
         return emit(rest);
       }
+      // Phone turns stay short: past the limit, finish the current sentence and stop.
+      if (spoken.length >= MAX_TURN_CHARS) {
+        const end = text.search(/[.!?]/);
+        if (end >= 0) {
+          speak(text.slice(0, end + 1));
+          return closeTurn();
+        }
+      }
       const q = text.indexOf("?");
       if (q < 0) return speak(text);
       speak(text.slice(0, q + 1));
@@ -393,7 +402,7 @@ export class RealtimeSession {
           continue;
         }
         if (turnClosed) continue; // drain the rest only to pick up tool calls
-        emit(speakable(filter.push(ev.text)));
+        emit(speakable(brackets.push(filter.push(ev.text))));
       }
       if (ctrl.signal.aborted) {
         if (!spoken) {
@@ -405,7 +414,7 @@ export class RealtimeSession {
         return;
       }
       this.retireNotes(notes);
-      if (!turnClosed) emit(speakable(filter.flush()));
+      if (!turnClosed) emit(speakable(brackets.push(filter.flush()) + brackets.flush()));
       if (held !== null && !turnClosed && afterQuestion(held, true) !== "cut") speak(held);
       held = null;
 
@@ -487,6 +496,37 @@ export class RealtimeSession {
   }
 }
 
+/** Drops bracketed stage directions like "[No response needed]" from a token stream. */
+export class BracketFilter {
+  private buf: string | null = null;
+  push(token: string): string {
+    let out = "";
+    for (const ch of token) {
+      if (this.buf !== null) {
+        this.buf += ch;
+        if (ch === "]") this.buf = null; // drop the whole bracketed note
+        else if (this.buf.length > 120) {
+          out += this.buf; // not a note after all
+          this.buf = null;
+        }
+      } else if (ch === "[") {
+        this.buf = "[";
+      } else {
+        out += ch;
+      }
+    }
+    return out;
+  }
+  flush(): string {
+    const out = this.buf ?? "";
+    this.buf = null;
+    return out;
+  }
+}
+
+/** Longest a single spoken turn should get (about 20 seconds of speech); ends at the next sentence. */
+export const MAX_TURN_CHARS = 320;
+
 /** Strips an end-of-call marker from a token stream, holding back text that might be its start. */
 export class MarkerFilter {
   private buf = "";
@@ -561,7 +601,8 @@ export function buildSystemPrompt(o: {
     "  a great assistant, not like a chatbot or customer-service script.",
     "- React like a person first, then answer: \"Oh nice.\", \"Ugh, yeah.\", \"Got it.\", \"Hm, good question.\" Match their energy and slang.",
     "- Keep the conversation alive like a real person would. When it's your turn, actually say something: answer properly,",
-    "  add a thought or opinion, and keep the ball rolling. Two to four sentences is normal; one-word replies are not.",
+    "  add a thought or opinion, and keep the ball rolling. Two or three sentences is right; one-word replies are not,",
+    "  and neither are speeches. For news or lists, give the top two or three things and offer more if they want.",
     "  Never stop halfway through a thought. Use contractions and everyday words, and vary how you start sentences.",
     "- Plain speech only: no lists, numbering, markdown, emoji, URLs or symbols. For steps, give ONE step, then wait.",
     "- Never use these: \"Sure thing\", \"Certainly\", \"Absolutely\", \"Great question\", \"Here's a quick rundown\",",
@@ -570,6 +611,8 @@ export function buildSystemPrompt(o: {
     `- Write ONLY your own words for this turn. Never write what ${o.userName} says or assume their answer.`,
     "- If you ask a question, make it the last thing you say, then stop.",
     "- If they say stop, skip, never mind, or change the subject, drop it immediately and don't bring it back.",
+    "- Never repeat something you just said. If they only say \"yep\" or \"okay\", either move things forward with something new or say nothing.",
+    "- Never write stage directions or notes like [No response needed]. If nothing needs saying, reply with nothing at all.",
     "- If they ask you to wait, hold on or be quiet, say only \"Sure, take your time.\" and stay silent until they speak.",
     "- Speech-to-text can mishear. If something sounds odd, briefly check what they meant.",
     "- Casual opinions are fine. If asked what you think, give a real but balanced take; on money add a quick \"not financial advice\".",

@@ -62,6 +62,10 @@ const fakeLLM: VoiceLLM = {
       for (const t of ["Okay, I'll look into flights ", "after the call. [END_CALL]"]) yield { type: "text", text: t };
       return;
     }
+    if (lastMsg.role === "user" && last.includes("ramble")) {
+      for (let i = 0; i < 20; i++) yield { type: "text", text: `This is sentence number ${i} of a very long answer. ` };
+      return;
+    }
     if (lastMsg.role === "user" && last.includes("honestly")) {
       for (const t of ["Honestly? ", "I think we should ", "talk about the new model."]) yield { type: "text", text: t };
       return;
@@ -232,6 +236,13 @@ test("speech cleanup, request matching and history window", () => {
   assert.equal(w[0].role, "system");
   assert.equal(w[1].role, "user");
   assert.ok(w.length <= 11);
+});
+
+test("stage directions are dropped and long turns are capped", async () => {
+  const { BracketFilter, MAX_TURN_CHARS } = await import("../src/realtime.js");
+  const b = new BracketFilter();
+  assert.equal(["[No resp", "onse needed]", "Okay."].map((t) => b.push(t)).join("") + b.flush(), "Okay.");
+  assert.ok(MAX_TURN_CHARS >= 200 && MAX_TURN_CHARS <= 400);
 });
 
 test("after-question judgement", async () => {
@@ -461,6 +472,11 @@ test("natural turn-taking: no double greeting, no reply to 'okay', never hangs u
   // A rhetorical question mid-reply is not the end of the turn.
   tw.send({ type: "prompt", voicePrompt: "What should we talk about, honestly", last: true });
   assert.equal(await tw.reply(), "Honestly? I think we should talk about the new model.");
+
+  // A rambling reply is cut at a sentence boundary once it gets too long.
+  tw.send({ type: "prompt", voicePrompt: "Go on, ramble", last: true });
+  const long = await tw.reply();
+  assert.ok(long.length < 420 && long.trim().endsWith("."), long);
 
   // The caller asks to end the call; the model says goodbye without the marker: still hangs up.
   tw.send({ type: "prompt", voicePrompt: "Okay, end the call.", last: true });
