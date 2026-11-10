@@ -69,7 +69,7 @@ export function groqLLM(apiKey: string, model: string, fallbackModel?: string): 
     m.startsWith("openai/gpt-oss")
       ? { reasoning_effort: "low" as const, include_reasoning: false }
       : m.startsWith("qwen/")
-        ? { reasoning_effort: "none" as const }
+        ? { reasoning_effort: "none" as const, include_reasoning: false }
         : {};
   async function withFallback<T>(run: (m: string) => Promise<T>): Promise<T> {
     try {
@@ -172,6 +172,7 @@ export function answerNote(request: string, answer: string): DeliveredNote {
 /** Strip things text-to-speech would read badly: markdown, bullets, line breaks. */
 export function speakable(text: string): string {
   return text
+    .replace(/<\/?think>/gi, "")
     .replace(/[*`#_~•]+/g, "")
     .replace(/\s*\n+\s*/g, " ")
     .replace(/([.!?])([A-Z])/g, "$1 $2");
