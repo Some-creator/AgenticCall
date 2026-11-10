@@ -219,6 +219,12 @@ test("real-time call: natural streamed conversation, interruption, goodbye and o
   const lastCall = llmCalls.at(-1)!;
   assert.equal(lastCall.at(-2)!.content, "Once upon…");
 
+  // Talking over the goodbye keeps the call open.
+  tw.send({ type: "interrupt", utteranceUntilInterrupt: "Okay,", durationUntilInterruptMs: 300 });
+  await assert.rejects(tw.next((m) => m.type === "end", 3000));
+  tw.send({ type: "prompt", voicePrompt: "Wait, one more thing. Actually no, bye!", last: true });
+  assert.equal(await tw.reply(), "Okay, talk soon! ");
+
   // After the goodbye is spoken, the server ends the relay session; Twilio then hits the Connect action.
   const end = await tw.next((m) => m.type === "end", 6000);
   assert.ok(end.handoffData);
@@ -232,7 +238,7 @@ test("real-time call: natural streamed conversation, interruption, goodbye and o
   assert.deepEqual(out.outcome.user_decisions, ["Move meeting to 2pm"]);
   assert.deepEqual(
     out.transcript.filter((t: any) => t.role === "user").map((t: any) => t.text),
-    ["Yeah, 2pm works.", "Let's chat a bit", "Tell me a story", "Never mind. Bye!"],
+    ["Yeah, 2pm works.", "Let's chat a bit", "Tell me a story", "Never mind. Bye!", "Wait, one more thing. Actually no, bye!"],
   );
   tw.ws.close();
   await client.close();

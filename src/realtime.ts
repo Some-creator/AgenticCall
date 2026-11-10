@@ -75,6 +75,12 @@ export class RealtimeSession {
   private history: ChatMessage[];
   private inflight: AbortController | null = null;
   private ending = false;
+  private endTimer: NodeJS.Timeout | null = null;
+
+  /** True while a goodbye is being spoken and the session is about to close. */
+  get isEnding(): boolean {
+    return this.ending;
+  }
   private closed = false;
 
   constructor(
@@ -111,6 +117,12 @@ export class RealtimeSession {
         const last = this.history.at(-1);
         // Keep only what the caller actually heard, so the model doesn't think it said more.
         if (last?.role === "assistant") last.content = heard ? `${heard}…` : "…";
+        // Talking over the goodbye means they're not done: keep the call open.
+        if (this.ending && this.endTimer) {
+          clearTimeout(this.endTimer);
+          this.endTimer = null;
+          this.ending = false;
+        }
         this.hooks.onInterrupted(heard);
         return;
       }
@@ -192,9 +204,11 @@ export class RealtimeSession {
     if (this.ending) return;
     this.ending = true;
     this.hooks.onWrapUp();
-    setTimeout(() => {
+    this.endTimer = setTimeout(() => {
+      this.endTimer = null;
       this.send({ type: "end", handoffData: JSON.stringify({ reason: "conversation_complete" }) });
-    }, speechMs(lastSpoken)).unref();
+    }, speechMs(lastSpoken));
+    this.endTimer.unref();
   }
 
   private send(msg: Record<string, unknown>): void {
@@ -268,7 +282,8 @@ export function buildSystemPrompt(o: {
     "- Only state facts from the briefing. If asked something you don't know, say you'll pass it on and follow up; never make things up.",
     "- You can't take actions during the call. Note what they want done; their agent will do it after you hang up.",
     "- Before ending, confirm any decision or request back to them in one sentence.",
-    `- Only end the call after ${o.userName} has clearly said they're done (or said goodbye). Then say a short goodbye with no question, and put ${END_MARKER} at the very end.`,
+    `- Never end the call on your own initiative. If ${o.userName} sounds finished but hasn't said goodbye, ask something like "Anything else before I let you go?" and wait.`,
+    `- Only after they say goodbye, or clearly say there's nothing else, reply with a short goodbye (no question) and put ${END_MARKER} at the very end.`,
     `- If they ask to hang up or say goodbye, say a short goodbye and end with ${END_MARKER}.`,
   ]
     .filter(Boolean)

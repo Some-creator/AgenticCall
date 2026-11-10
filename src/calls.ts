@@ -489,7 +489,7 @@ export class CallManager {
       onWrapUp: () => {
         // Safety net: if Twilio doesn't end the call after the goodbye, hang up ourselves.
         setTimeout(() => {
-          if (!TERMINAL.has(rec.status) && rec.sid) {
+          if (!TERMINAL.has(rec.status) && rec.sid && rec.session?.isEnding) {
             void this.tel.hangup(rec.sid).catch((e) => log.warn(`hangup failed: ${e.message}`));
           }
         }, 20_000).unref();
