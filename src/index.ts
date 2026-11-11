@@ -4,7 +4,8 @@ import { loadConfig } from "./config.js";
 import { CallManager, twilioTelephony } from "./calls.js";
 import { buildMcpServer } from "./tools.js";
 import { createApp } from "./app.js";
-import { attachRelayServer, groqLLM, logGroqModels } from "./realtime.js";
+import { attachRelayServer, groqLLM, logGroqModels, type VoiceLLM } from "./realtime.js";
+import { anthropicLLM, withBackup } from "./anthropic.js";
 import { log } from "./log.js";
 
 async function main() {
@@ -16,7 +17,11 @@ async function main() {
     );
   }
 
-  const llm = cfg.groq.apiKey ? groqLLM(cfg.groq.apiKey, cfg.groq.model, cfg.groq.fallbackModel) : undefined;
+  // Claude (if configured) leads; Groq is the backup when Claude is rate-limited or overloaded.
+  const groq = cfg.groq.apiKey ? groqLLM(cfg.groq.apiKey, cfg.groq.model, cfg.groq.fallbackModel) : undefined;
+  const claude = cfg.anthropic.apiKey ? anthropicLLM(cfg.anthropic.apiKey, cfg.anthropic.model) : undefined;
+  const llm: VoiceLLM | undefined =
+    claude && groq ? withBackup(claude, groq, [cfg.anthropic.model, `Groq ${cfg.groq.model}`]) : (claude ?? groq);
   const calls = new CallManager(cfg, twilioTelephony(cfg), { llm });
   const app = createApp(cfg, calls);
   const server = await new Promise<import("node:http").Server>((resolve) => {
@@ -27,8 +32,8 @@ async function main() {
   log.info(`Twilio webhooks at ${cfg.publicBaseUrl}/twilio/* (listening on ${cfg.host}:${cfg.port})`);
   log.info(
     cfg.defaultMode === "realtime"
-      ? `Real-time voice: Groq ${cfg.groq.model}`
-      : "Turn-by-turn voice (set GROQ_API_KEY for real-time conversations)",
+      ? `Real-time voice: ${claude ? `${cfg.anthropic.model}${groq ? ` (backup: Groq ${cfg.groq.model})` : ""}` : `Groq ${cfg.groq.model}`}`
+      : "Turn-by-turn voice (set ANTHROPIC_API_KEY or GROQ_API_KEY for real-time conversations)",
   );
 
   // On a redeploy, the platform sends SIGTERM. Don't drop a call that's in progress: keep this instance

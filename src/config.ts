@@ -26,11 +26,13 @@ function int(name: string, fallback: number, min = 0, max = Number.MAX_SAFE_INTE
   return n;
 }
 
-function callMode(raw: string | undefined, hasGroq: boolean): "realtime" | "turn_by_turn" {
+function callMode(raw: string | undefined, hasVoiceModel: boolean): "realtime" | "turn_by_turn" {
   const v = raw?.trim().toLowerCase();
-  if (!v) return hasGroq ? "realtime" : "turn_by_turn";
+  if (!v) return hasVoiceModel ? "realtime" : "turn_by_turn";
   if (v === "realtime" || v === "turn_by_turn") {
-    if (v === "realtime" && !hasGroq) throw new Error("CALL_MODE=realtime needs GROQ_API_KEY (free at console.groq.com)");
+    if (v === "realtime" && !hasVoiceModel) {
+      throw new Error("CALL_MODE=realtime needs ANTHROPIC_API_KEY or GROQ_API_KEY");
+    }
     return v;
   }
   throw new Error(`CALL_MODE must be "realtime" or "turn_by_turn", got "${raw}"`);
@@ -90,6 +92,8 @@ export interface Config {
   /** Requests estimated to take longer than this get a "stay on the line or call you back?" offer. */
   callbackThresholdSeconds: number;
   groq: { apiKey: string | null; model: string; fallbackModel: string };
+  /** Claude as the voice model (preferred when set); Groq becomes the backup. */
+  anthropic: { apiKey: string | null; model: string };
   relay: { ttsProvider?: string; voice?: string; transcriptionProvider?: string; speechModel?: string };
 }
 
@@ -152,7 +156,14 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     timezone: optional("TIMEZONE", "America/New_York"),
     agentAnswerTimeoutSeconds: int("AGENT_ANSWER_TIMEOUT_SECONDS", 45, 5, 600),
     callbackThresholdSeconds: int("CALLBACK_THRESHOLD_SECONDS", 60, 5, 3600),
-    defaultMode: callMode(process.env.CALL_MODE, Boolean(process.env.GROQ_API_KEY?.trim())),
+    defaultMode: callMode(
+      process.env.CALL_MODE,
+      Boolean(process.env.GROQ_API_KEY?.trim() || process.env.ANTHROPIC_API_KEY?.trim()),
+    ),
+    anthropic: {
+      apiKey: process.env.ANTHROPIC_API_KEY?.trim() || null,
+      model: optional("ANTHROPIC_MODEL", "claude-haiku-5-5"),
+    },
     groq: {
       apiKey: process.env.GROQ_API_KEY?.trim() || null,
       model: optional("GROQ_MODEL", "openai/gpt-oss-120b"),

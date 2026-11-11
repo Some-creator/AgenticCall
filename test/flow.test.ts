@@ -58,6 +58,7 @@ before(async () => {
     agentAnswerTimeoutSeconds: 45,
     callbackThresholdSeconds: 60,
     groq: { apiKey: null, model: "test", fallbackModel: "test" },
+    anthropic: { apiKey: null, model: "test" },
     relay: {},
   };
   const calls = new CallManager(cfg, fakeTel);

@@ -164,6 +164,7 @@ before(async () => {
     agentAnswerTimeoutSeconds: 45,
     callbackThresholdSeconds: 60,
     groq: { apiKey: "x", model: "test", fallbackModel: "test" },
+    anthropic: { apiKey: null, model: "test" },
     relay: {},
   } satisfies Config as Config;
   const calls = new CallManager(cfg, tel, { llm: fakeLLM });

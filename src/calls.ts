@@ -218,7 +218,7 @@ export class CallManager {
     const mode = input.mode ?? this.cfg.defaultMode;
     if (mode === "realtime" && !this.llm) {
       throw new CallError(
-        'Real-time mode is not configured on this server (GROQ_API_KEY is missing). Use mode "turn_by_turn".',
+        'Real-time mode is not configured on this server (no ANTHROPIC_API_KEY or GROQ_API_KEY). Use mode "turn_by_turn".',
       );
     }
     const active = [...this.calls.values()].find((c) => !TERMINAL.has(c.status));
@@ -685,7 +685,7 @@ export class CallManager {
 
     const llm = this.llm!;
     const system = buildSystemPrompt({
-      model: this.cfg.groq.model,
+      model: this.cfg.anthropic.apiKey ? this.cfg.anthropic.model : `${this.cfg.groq.model} on Groq`,
       callerName: rec.callerName,
       userName: this.cfg.userName,
       opening: rec.opening,

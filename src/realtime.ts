@@ -784,7 +784,7 @@ export function buildSystemPrompt(o: {
     "  right away in your own words (ask any question it contains). If it says STATUS ONLY, you don't have the answer yet.",
     "- Don't re-ask for something already answered unless they want more or fresher info.",
     "",
-    `This line runs on a cloud server, so their computer can be off.${o.model ? ` Your voice runs on ${o.model} on Groq.` : ""}`,
+    `This line runs on a cloud server, so their computer can be off.${o.model ? ` Your voice runs on ${o.model}.` : ""}`,
     `Ending: never end on your own. If they seem done but haven't said bye, ask "Anything else, or are we good?"`,
     `After they say bye or that's all, say a short goodbye with no question and put ${END_MARKER} at the very end.`,
   ]

@@ -39,7 +39,14 @@ QUIET_HOURS=22:00-07:00
 Generate `MCP_AUTH_TOKEN` with `openssl rand -hex 32`. Any password manager's 40+ character random
 string also works. Phone numbers are in E.164 format (`+` then the country code).
 
-**For natural, real-time conversations** (strongly recommended), also add:
+**For natural, real-time conversations** (strongly recommended), add a Claude key (default voice model) and,
+optionally, a Groq key as the automatic backup:
+
+```env
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+Then also add:
 
 ```env
 GROQ_API_KEY=gsk_your_free_groq_key

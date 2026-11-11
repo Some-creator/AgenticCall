@@ -208,6 +208,7 @@ All options are listed in [`.env.example`](.env.example). The main ones:
 | `TWILIO_VOICE` | `Polly.Joanna-Neural` | Any voice Twilio `<Say>` supports. |
 | `ANSWERING_MACHINE_DETECTION` | `true` | Uses Twilio AMD; adds a few seconds before the greeting. |
 | `SPEECH_TIMEOUT_SECONDS` | `8` | Silence before the "are you still there?" re-prompt. |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` | unset / `claude-haiku-5-5` | Claude runs the live conversation (default when set); Groq becomes the backup. |
 | `GROQ_API_KEY` / `GROQ_MODEL` | unset / `openai/gpt-oss-120b` | Turns on real-time mode. Any Groq chat model ID works. |
 | `GROQ_FALLBACK_MODEL` | `openai/gpt-oss-120b,openai/gpt-oss-20b` | Comma-separated backups, tried in order when a model is rate-limited (each has its own limit). |
 | `CALL_MODE` | `realtime` if a Groq key is set | `realtime` or `turn_by_turn`. Agents can also choose per call. |
