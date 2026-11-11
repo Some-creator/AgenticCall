@@ -179,6 +179,8 @@ export interface WaitResult {
   still_waiting?: boolean;
   /** Real-time calls: questions/commands from the user that only you (the agent) can handle. Answer with answer_on_call. */
   agent_requests?: { request_id: string; request: string }[];
+  /** With agent_requests: the recent conversation, so answers fit what the user already said. */
+  conversation_so_far?: string[];
   /** Real-time calls that ended with requests still unanswered: finish them, then call back or text. */
   open_requests?: { request_id: string; request: string; eta_seconds?: number }[];
   /** Real-time calls: what was said and decided, once the call has ended. */
@@ -435,9 +437,14 @@ export class CallManager {
         call_id: rec.id,
         status: rec.status,
         agent_requests: asks.map((a) => ({ request_id: a.request_id, request: a.request })),
+        conversation_so_far: rec.transcript
+          .filter((t) => t.role !== "system")
+          .slice(-20)
+          .map((t) => `${t.role === "user" ? "User" : "Assistant"}: ${t.text}`),
         hint:
           "The user is ON THE LINE right now waiting for this. Handle it immediately with your own tools, then call " +
-          "answer_on_call with a short plain-spoken answer (or what you did). Then call wait_for_reply again.",
+          "answer_on_call with a short plain-spoken answer (or what you did). Use conversation_so_far so the answer " +
+          "respects what they already said (e.g. don't suggest something they rejected). Then call wait_for_reply again.",
       };
     }
     if (TERMINAL.has(rec.status)) {

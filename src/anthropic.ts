@@ -19,8 +19,8 @@ import {
 const ASK_AGENT: Anthropic.Tool = {
   name: ASK_AGENT_TOOL,
   description:
-    "Hand a question or command to your back office, which has the user's email, calendar, files, accounts, the " +
-    "web, and can take actions. Use it for ANY fact, name, price, recommendation or current info not already in " +
+    "Look something up or get something done for the user: their email, calendar, files, accounts, the web, " +
+    "and actions. Use it for ANY fact, name, price, recommendation or current info not already in " +
     "this conversation, and for anything the user asks you to do. Never answer those from memory.",
   input_schema: {
     type: "object",
@@ -79,8 +79,10 @@ export function anthropicLLM(apiKey: string, model: string): VoiceLLM {
   return {
     async *stream(history, signal, opts) {
       const toolsOff = opts?.tools === false;
-      // With tools off, send a plain history: tool_use blocks in the history require tool definitions.
-      const { system, messages } = toAnthropic(toolsOff ? plainHistory(windowHistory(history)) : windowHistory(history));
+      // Claude keeps much more of the call in view than Groq (no tight per-minute token limit). The window moves in
+      // blocks of 20 and the tools stay the same on every request (tool_choice "none" when it must just talk), so
+      // each request starts the same way as the last and is mostly read from the prompt cache at a tenth the price.
+      const { system, messages } = toAnthropic(windowHistory(history, 60, 20));
       const stream = client.messages.stream(
         {
           model,
@@ -89,7 +91,9 @@ export function anthropicLLM(apiKey: string, model: string): VoiceLLM {
           messages,
           thinking: { type: "disabled" },
           output_config: { effort: "low" },
-          ...(toolsOff ? {} : { tools: [ASK_AGENT], tool_choice: { type: "auto" as const } }),
+          tools: [ASK_AGENT],
+          tool_choice: toolsOff ? { type: "none" } : { type: "auto" },
+          cache_control: { type: "ephemeral" },
         },
         { signal },
       );

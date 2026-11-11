@@ -35,8 +35,8 @@ const VOICE_TOOLS = [
     function: {
       name: ASK_AGENT_TOOL,
       description:
-        "Hand a question or command to your back office, which has the user's email, calendar, files, accounts, the " +
-        "web, and can take actions. Use it for ANY fact, name, price, recommendation or current info not already in " +
+        "Look something up or get something done for the user: their email, calendar, files, accounts, the web, " +
+        "and actions. Use it for ANY fact, name, price, recommendation or current info not already in " +
         "this conversation, and for anything the user asks you to do. Never answer those from memory.",
       parameters: {
         type: "object",
@@ -53,19 +53,32 @@ const VOICE_TOOLS = [
 ];
 
 /** Keep the system prompt plus the recent conversation, so long calls stay fast and under rate limits. */
-export function windowHistory(messages: ChatMessage[], max = 12): ChatMessage[] {
+export function windowHistory(messages: ChatMessage[], max = 12, step = 1): ChatMessage[] {
   let out = messages;
   if (messages.length > max + 1) {
     const rest = messages.slice(1);
-    let start = rest.length - max;
+    // With step > 1 the window jumps forward in blocks instead of one message per turn, so the start of the
+    // request stays identical between jumps and prompt caching keeps working.
+    let start = Math.ceil((rest.length - max) / step) * step;
     // Start at a user turn so a tool result is never separated from its tool call.
     while (start < rest.length && rest[start].role !== "user") start++;
-    out = [messages[0], ...rest.slice(start)];
+    // Everything the caller said before the window is kept (their own lines are short), so the model still knows
+    // what they liked, ruled out or decided earlier in the call.
+    const earlier = rest
+      .slice(0, start)
+      .filter((m) => m.role === "user" && !m.content.startsWith("[Result of your lookup"))
+      .map((m) => `- ${m.content}`)
+      .join("\n");
+    const memory = earlier ? `\n\nEarlier in this call they said (oldest first):\n${earlier.slice(-2500)}` : "";
+    out = [{ role: "system", content: messages[0].content + memory }, ...rest.slice(start)];
   }
-  // Older long messages (agent answers, long replies) are clipped; the latest few stay whole.
-  const keepWhole = out.length - 4;
+  // Older long chat turns are clipped to save tokens; lookup results are never clipped (losing their details made
+  // the voice think it had invented things), and the latest few messages stay whole.
+  const keepWhole = out.length - 6;
   return out.map((m, i) =>
-    i > 0 && i < keepWhole && m.content.length > 500 ? { ...m, content: `${m.content.slice(0, 500)}…` } : m,
+    i > 0 && i < keepWhole && m.content.length > 900 && !m.content.startsWith("[Result of your lookup")
+      ? { ...m, content: `${m.content.slice(0, 900)}…` }
+      : m,
   );
 }
 
@@ -215,7 +228,7 @@ export const END_MARKER = "[END_CALL]";
 
 const FILLERS = ["Let me check.", "Give me a few seconds.", "Let me look that up.", "Hang on, checking now."];
 
-const NOTE_PREFIX = "[Update from your back office. The caller did NOT say this.]";
+const NOTE_PREFIX = "[Result of your lookup. The caller did NOT say this.]";
 
 /**
  * After a "?" the model sometimes keeps going and answers for the caller ("Anything else? No, that's all.").
@@ -475,9 +488,10 @@ export class RealtimeSession {
         if (d === "cut") return closeTurn();
         return emit(rest);
       }
-      // Phone turns stay short: past the limit, finish the current sentence and stop.
-      if (spoken.length >= MAX_TURN_CHARS) {
-        const end = text.search(/[.!?]/);
+      // Phone turns stay short: past the limit, finish the current sentence and stop. Relaying a result with
+      // several parts gets more room so later parts aren't dropped. "Perfume.com" is not a sentence end.
+      if (spoken.length >= (notes.length > 0 ? MAX_RELAY_CHARS : MAX_TURN_CHARS)) {
+        const end = text.search(/[.!?](?=\s)/);
         if (end >= 0) {
           speak(text.slice(0, end + 1));
           return closeTurn();
@@ -692,6 +706,8 @@ export class BracketFilter {
 
 /** Longest a single spoken turn should get (about 20 seconds of speech); ends at the next sentence. */
 export const MAX_TURN_CHARS = 320;
+/** Relaying a lookup result (often several options) may run longer, about 45 seconds. */
+export const MAX_RELAY_CHARS = 700;
 
 /** Strips an end-of-call marker from a token stream, holding back text that might be its start. */
 export class MarkerFilter {
@@ -773,15 +789,21 @@ export function buildSystemPrompt(o: {
     "- Practice sessions (mock interview, quiz): you ask, they answer, you give short feedback. Their answers aren't tasks.",
     "- Casual opinions are fine (add \"not financial advice\" on money). Speech-to-text mishears: check odd words.",
     "",
-    "The ask_agent tool reaches your back office: their email, calendar, files, accounts, the web, and actions.",
+    "The ask_agent tool is how you look things up and get things done: their email, calendar, files, accounts, the web.",
     "- You have NO knowledge of your own about products, brands, prices, deals, places, people, news, or their life.",
     "  Any name, number, price or recommendation that isn't already in this conversation must come from ask_agent.",
     "  Never fill it in from memory, even if you think you know. Small talk and opinions about what's been said are fine.",
-    "- Say a short line first (\"Let me check.\"), then pass their full request with every detail.",
+    "- Say a short line first (\"Let me check.\"), then pass their full request with every detail, plus anything",
+    "  relevant they've told you on this call (budget, what they liked, what they already ruled out).",
+    "- Remember what they've told you. Never suggest something they already turned down.",
     "- When they change or add details (budget, dates, preferences), call ask_agent again with the updated request.",
-    "- To them you're one assistant; never mention a back office. Never guess or invent an answer.",
-    "- Messages starting [Update from your back office...] are from it, not from them. When one has an answer, tell them",
+    "- Speak as yourself (\"I found\", \"I checked\"). Never mention a back office, a team, a tool or another assistant.",
+    "  Never guess or invent an answer.",
+    "- Messages starting [Result of your lookup...] are results, not things they said. When one has an answer, tell them",
     "  right away in your own words (ask any question it contains). If it says STATUS ONLY, you don't have the answer yet.",
+    "- When a result has several parts (options, items, steps), say how many first (\"There are three options.\"), then",
+    "  cover every one briefly and end with the recommendation if there is one. Never silently drop a part.",
+    "- If they asked for several things, keep track of all of them and come back to any that are still open.",
     "- Don't re-ask for something already answered unless they want more or fresher info.",
     "",
     `This line runs on a cloud server, so their computer can be off.${o.model ? ` Your voice runs on ${o.model}.` : ""}`,

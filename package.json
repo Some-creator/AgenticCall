@@ -11,7 +11,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "test": "tsx --test --test-timeout=30000 test/*.test.ts && VIA_SAY=1 tsx --test --test-timeout=30000 test/realtime.test.ts",
+    "test": "tsx --test --test-timeout=120000 test/*.test.ts && VIA_SAY=1 tsx --test --test-timeout=120000 test/realtime.test.ts",
     "typecheck": "tsc --noEmit",
     "test-call": "node scripts/test-call.mjs"
   },

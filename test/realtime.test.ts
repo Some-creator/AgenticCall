@@ -40,11 +40,26 @@ const fakeLLM: VoiceLLM = {
     llmTools.push(opts?.tools);
     const lastMsg = messages.at(-1)!;
     const last = lastMsg.content.toLowerCase();
-    if (last.includes("back office") && last.includes("dentist")) {
+    if (last.includes("result of your lookup") && last.includes("three options")) {
+      const parts = [
+        "There are three options. ",
+        "First, AI ordering storefronts for local print shops, which have almost no competition yet. ",
+        "Second, selling API access to your trading data for people who build bots. ",
+        "Third, running ads only for print and merch shops, since you know those customers well. ",
+        "My pick is the first one, because you've already built most of it and have a shop to prove it works. ",
+      ];
+      for (const t of parts) yield { type: "text", text: t };
+      return;
+    }
+    if (lastMsg.role === "user" && last.includes("business ideas")) {
+      yield { type: "tool_call", call: { id: "tc9", type: "function", function: { name: "ask_agent", arguments: '{"request":"business ideas"}' } } };
+      return;
+    }
+    if (last.includes("result of your lookup") && last.includes("dentist")) {
       for (const t of ["Friday you've got ", "the dentist at 10. ", "Anything else?"]) yield { type: "text", text: t };
       return;
     }
-    if (last.includes("back office") && last.includes("call them back when it's done")) {
+    if (last.includes("result of your lookup") && last.includes("call them back when it's done")) {
       for (const t of ["That'll take about 5 minutes. ", "Want to stay on, or should I call you back?"]) yield { type: "text", text: t };
       return;
     }
@@ -254,6 +269,12 @@ test("speech cleanup, request matching and history window", () => {
   for (let i = 0; i < 40; i++) msgs.push({ role: i % 2 ? "assistant" : "user", content: String(i) });
   const w = windowHistory(msgs, 10);
   assert.equal(w[0].role, "system");
+  // What the caller said before the window is kept in the system message.
+  assert.match(w[0].content, /Earlier in this call they said[\s\S]*- 0\n- 2/);
+  // Stepped windows only move every `step` messages, so consecutive turns share the same start (cache-friendly).
+  const a1 = windowHistory(msgs.slice(0, 35), 10, 10);
+  const a2 = windowHistory(msgs.slice(0, 37), 10, 10);
+  assert.equal(a1[1].content, a2[1].content);
   assert.equal(w[1].role, "user");
   assert.ok(w.length <= 11);
 });
@@ -409,7 +430,7 @@ test("real-time call: user asks something only the agent knows, mid-call", async
   assert.equal(llmTools.at(-1), false); // answering, not re-asking
   const sent = llmCalls.at(-1)!;
   assert.equal(sent.at(-1)!.role, "user");
-  assert.match(sent.at(-1)!.content, /^\[Update from your back office/);
+  assert.match(sent.at(-1)!.content, /^\[Result of your lookup/);
   assert.equal((sent.at(-2) as any).role, "tool");
   assert.equal((sent.at(-3) as any).tool_calls[0].function.name, "ask_agent");
 
@@ -435,6 +456,21 @@ test("real-time call: user asks something only the agent knows, mid-call", async
   // An empty ask_agent call (e.g. "hold on") doesn't trigger "let me check".
   tw.send({ type: "prompt", voicePrompt: "Hold on a sec", last: true });
   assert.equal(await tw.reply(), "");
+
+  // A multi-part answer is read out in full, recommendation included (it used to be cut after ~20s).
+  tw.send({ type: "prompt", voicePrompt: "Give me some business ideas", last: true });
+  await tw.reply(); // "Let me check." filler
+  const ideas = JSON.parse(
+    ((await client.callTool({ name: "wait_for_reply", arguments: { call_id: first.call_id, timeout_seconds: 5 } })) as any)
+      .content[0].text,
+  );
+  await client.callTool({
+    name: "answer_on_call",
+    arguments: { call_id: first.call_id, request_id: ideas.agent_requests[0].request_id, answer: "three options: ..." },
+  });
+  const full = await tw.reply();
+  assert.match(full, /Third, running ads/);
+  assert.match(full, /My pick is the first one/);
 
   tw.send({ type: "prompt", voicePrompt: "No, bye!", last: true });
   await tw.reply();

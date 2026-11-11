@@ -15,7 +15,7 @@ test("history converts to the Messages API shape", () => {
       tool_calls: [{ id: "call_1_x", type: "function", function: { name: "ask_agent", arguments: '{"request":"calendar"}' } }],
     },
     { role: "tool", tool_call_id: "call_1_x", content: "Sent." },
-    { role: "user", content: "[Update from your back office] Gym at 8." },
+    { role: "user", content: "[Result of your lookup. The caller did NOT say this.] Gym at 8." },
   ];
   const { system, messages } = toAnthropic(history);
   assert.equal(system, "You are on a call.");
