@@ -1,6 +1,6 @@
 import type { IncomingMessage, Server } from "node:http";
 import type { Duplex } from "node:stream";
-import Groq, { InternalServerError, RateLimitError } from "groq-sdk";
+import Groq, { BadRequestError, InternalServerError, RateLimitError } from "groq-sdk";
 import { WebSocketServer, type WebSocket } from "ws";
 import type { Config } from "./config.js";
 import { log } from "./log.js";
@@ -69,6 +69,16 @@ export function windowHistory(messages: ChatMessage[], max = 12): ChatMessage[] 
   );
 }
 
+/**
+ * The same conversation without tool-call details: assistant turns that called a tool become plain text and tool
+ * results are dropped. Used when the provider rejects the full history, so the call can carry on.
+ */
+export function plainHistory(messages: ChatMessage[]): ChatMessage[] {
+  return messages
+    .filter((m) => m.role !== "tool")
+    .map((m) => (m.role === "assistant" ? { role: "assistant" as const, content: m.content || "…" } : m));
+}
+
 /** Every model was rate-limited; retry after this long. */
 export class RateLimitedError extends Error {
   constructor(public retryAfterMs: number) {
@@ -131,23 +141,39 @@ export function groqLLM(apiKey: string, model: string, fallbackModels?: string):
   return {
     async *stream(messages, signal, opts) {
       const t0 = Date.now();
-      const stream = await withFallback((m) =>
-        client.chat.completions.create(
-          {
-            model: m,
-            messages: windowHistory(messages) as never,
-            stream: true,
-            // Generous: reasoning models spend part of this on hidden thinking, and running out cuts the reply
-            // mid-word. Spoken length is capped separately (MAX_TURN_CHARS).
-            max_completion_tokens: 1500,
-            tools: VOICE_TOOLS,
-            tool_choice: opts?.tools === false ? "none" : "auto",
-            parallel_tool_calls: false,
-            ...reasoningFor(m),
-          },
-          { signal },
-        ),
-      );
+      const open = (msgs: ChatMessage[], withTools: boolean) =>
+        withFallback((m) =>
+          client.chat.completions.create(
+            {
+              model: m,
+              messages: msgs as never,
+              stream: true,
+              // Generous: reasoning models spend part of this on hidden thinking, and running out cuts the reply
+              // mid-word. Spoken length is capped separately (MAX_TURN_CHARS).
+              max_completion_tokens: 1500,
+              ...(withTools
+                ? { tools: VOICE_TOOLS, tool_choice: opts?.tools === false ? "none" : "auto", parallel_tool_calls: false }
+                : {}),
+              ...reasoningFor(m),
+            },
+            { signal },
+          ),
+        );
+      // With tools off, offer none at all: some models call a tool anyway when tool_choice is "none", and the
+      // provider then rejects the reply ("Tool choice is none, but model called a tool"), over and over.
+      const toolsOff = opts?.tools === false;
+      let stream;
+      try {
+        stream = toolsOff
+          ? await open(plainHistory(windowHistory(messages)), false)
+          : await open(windowHistory(messages), true);
+      } catch (err) {
+        if (!(err instanceof BadRequestError) || toolsOff) throw err;
+        // The provider rejected this history outright (retrying it as-is would fail forever): carry on with a
+        // plain-text version of the conversation instead.
+        log.warn(`Groq rejected the request (${(err as Error).message.slice(0, 200)}); retrying with plain history`);
+        stream = await open(plainHistory(windowHistory(messages)), true);
+      }
       const calls = new Map<number, ToolCall>();
       let first = true;
       for await (const chunk of stream) {
@@ -219,6 +245,8 @@ export interface SessionHooks {
   onAskAgent(request: string): DeliveredNote | null;
   /** The model said goodbye; the session will close shortly. */
   onWrapUp(): void;
+  /** Something worth keeping in the call log (e.g. a voice-model error). */
+  onNote?(text: string): void;
 }
 
 /** Information handed to the voice model mid-call. `after` replaces it once it has been used ("" removes it). */
@@ -301,6 +329,7 @@ export class RealtimeSession {
   private ending = false;
   private endTimer: NodeJS.Timeout | null = null;
   private fillerIdx = 0;
+  private toolSeq = 0;
   /** Notes delivered but not yet used in a reply. */
   private freshNotes: { entry: ChatMessage; after: string }[] = [];
   private fillerTimer: NodeJS.Timeout | null = null;
@@ -529,7 +558,8 @@ export class RealtimeSession {
       if (ask && request) {
         if (!spoken.trim()) speak(FILLERS[this.fillerIdx++ % FILLERS.length]);
         closeTurn();
-        ask.id ||= `call_${Date.now()}`;
+        // Always our own id: some models reuse ids, and duplicate ids make the provider reject the whole history.
+        ask.id = `call_${++this.toolSeq}_${Date.now().toString(36)}`;
         entry.tool_calls = [ask];
         this.history.push({
           role: "tool",
@@ -574,6 +604,7 @@ export class RealtimeSession {
       if (ctrl.signal.aborted) return;
       const status = (err as { status?: number }).status;
       log.error(`voice model failed (${status ?? "no status"}): ${(err as Error).message.slice(0, 300)}`);
+      this.hooks.onNote?.(`Voice model error (${status ?? "no status"}): ${(err as Error).message.slice(0, 300)}`);
       this.freshNotes.unshift(...notes); // nothing was relayed: keep them for the retry
       const now = Date.now();
       this.failingSince ??= now;

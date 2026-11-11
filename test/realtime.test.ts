@@ -264,6 +264,19 @@ test("stage directions are dropped and long turns are capped", async () => {
   assert.ok(MAX_TURN_CHARS >= 200 && MAX_TURN_CHARS <= 400);
 });
 
+test("plain history drops tool details", async () => {
+  const { plainHistory } = await import("../src/realtime.js");
+  const out = plainHistory([
+    { role: "system", content: "s" },
+    { role: "user", content: "q" },
+    { role: "assistant", content: "Let me check.", tool_calls: [{ id: "a", type: "function", function: { name: "ask_agent", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "a", content: "Sent." },
+    { role: "user", content: "[Update] answer" },
+  ]);
+  assert.deepEqual(out.map((m) => m.role), ["system", "user", "assistant", "user"]);
+  assert.equal((out[2] as any).tool_calls, undefined);
+});
+
 test("after-question judgement", async () => {
   const { afterQuestion } = await import("../src/realtime.js");
   assert.equal(afterQuestion(" No, that's all."), "cut");

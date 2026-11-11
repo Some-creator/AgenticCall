@@ -734,6 +734,9 @@ export class CallManager {
         this.armRequestTimer(rec, req, this.cfg.agentAnswerTimeoutSeconds * 1000);
         return null;
       },
+      onNote: (text) => {
+        rec.transcript.push(this.turn("system", text));
+      },
       onInterrupted: (heard) => {
         rec.transcript.push(this.turn("system", `User interrupted after: "${heard}"`));
       },
