@@ -45,6 +45,7 @@ export function telnyxTelephony(cfg: TelnyxConfig, maxCallSeconds: number): Tele
         interruptible_greeting: "any",
         language: o.language,
         custom_parameters: o.customParameters,
+        ...(o.voice ? { voice: o.voice } : {}),
       });
     },
   };

@@ -123,7 +123,7 @@ export interface Telephony {
   /** Telnyx: start Conversation Relay on an answered call. */
   startRelay?(
     sid: string,
-    opts: { url: string; greeting: string; language: string; customParameters: Record<string, string> },
+    opts: { url: string; greeting: string; language: string; customParameters: Record<string, string>; voice?: string },
   ): Promise<void>;
 }
 
@@ -316,7 +316,10 @@ export class CallManager {
     } catch (err) {
       rec.status = "failed";
       rec.endedAt = this.now();
-      throw new CallError(`${this.tel.provider} refused to place the call: ${(err as Error).message}`);
+      const why = `${this.tel.provider} refused to place the call: ${(err as Error).message}`;
+      rec.transcript.push(this.turn("system", why)); // keep the reason visible in get_call / list_calls
+      log.error(`call ${id}: ${why}`);
+      throw new CallError(why);
     }
     return rec;
   }
@@ -566,6 +569,7 @@ export class CallManager {
             greeting: rec.opening,
             language: this.cfg.language,
             customParameters: { cid: rec.id, secret: rec.relaySecret },
+            voice: this.cfg.telnyx?.voice,
           });
         } catch (e) {
           log.error(`call ${rec.id}: couldn't start Telnyx Conversation Relay: ${(e as Error).message}`);

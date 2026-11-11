@@ -432,12 +432,27 @@ export class RealtimeSession {
           this.fillerTimer.unref();
           return;
         }
+        // Speech recognition sometimes splits one sentence into fragments ("Yeah." + "I can hear you."). Give a
+        // short fragment a moment for the rest to arrive, so it gets one reply instead of two that run together.
+        if (text.split(/\s+/).length <= 3 && !text.includes("?") && this.freshNotes.length === 0) {
+          this.fillerTimer = setTimeout(() => {
+            this.fillerTimer = null;
+            void this.respond();
+          }, 700);
+          this.fillerTimer.unref();
+          return;
+        }
         void this.respond();
         return;
       }
       case "interrupt": {
-        this.inflight?.abort();
         const heard = String(msg.utteranceUntilInterrupt ?? msg.utterance_until_interrupt ?? "");
+        const lastSaid = [...this.history].reverse().find((m) => m.role === "assistant")?.content ?? "";
+        // Some providers (Telnyx) report an "interrupt" whenever the caller starts talking, even after the reply
+        // finished playing. If they heard all of it, nothing was cut off: don't treat it as an interruption.
+        const norm = (t: string) => t.toLowerCase().replace(/[^a-z0-9]+/g, "");
+        if (!this.inflight && heard && norm(heard).length >= norm(lastSaid).length * 0.9) return;
+        this.inflight?.abort();
         const last = this.history.at(-1);
         // Keep only what the caller actually heard, so the model doesn't think it said more.
         if (last?.role === "assistant" && !last.tool_calls) last.content = heard ? `${heard}…` : "…";
@@ -865,10 +880,13 @@ export function buildSystemPrompt(o: {
     "- Say a short line first (\"Let me check.\"), then pass their full request with every detail, plus anything",
     "  relevant they've told you on this call (budget, what they liked, what they already ruled out).",
     "- Remember what they've told you. Never suggest something they already turned down.",
+    "- If they mention something from before this call that you don't know (\"earlier we looked at...\"), don't say you",
+    "  don't know: ask_agent, which remembers their past chats and calls, and carry on with what it finds.",
     "- When they tell you something about themselves worth knowing next time (likes, dislikes, budget, routines,",
     "  people, plans), call remember with one short fact. Don't announce it; just keep the conversation going.",
     "- When they change or add details (budget, dates, preferences), call ask_agent again with the updated request.",
-    "- Speak as yourself (\"I found\", \"I checked\"). Never mention a back office, a team, a tool or another assistant.",
+    "- Speak as yourself (\"I found\", \"I checked\"). Never mention a back office, a team, a tool, \"the lookup\" or another",
+    "  assistant.",
     "  Never guess or invent an answer.",
     "- Messages starting [Result of your lookup...] are results, not things they said. When one has an answer, tell them",
     "  right away in your own words (ask any question it contains). If it says STATUS ONLY, you don't have the answer yet.",
@@ -877,7 +895,10 @@ export function buildSystemPrompt(o: {
     "- If they asked for several things, keep track of all of them and come back to any that are still open.",
     "- Don't re-ask for something already answered unless they want more or fresher info.",
     "",
-    `This line runs on a cloud server, so their computer can be off.${o.model ? ` Your voice runs on ${o.model}.` : ""}`,
+    `This line runs on a cloud server, so their computer can be off.${o.model ? ` Your brain runs on ${o.model}.` : ""}`,
+    "Your speaking voice is a server setting (TELNYX_VOICE in Railway for Telnyx calls); you can't change it mid-call,",
+    "but tell them that's where it's set. Any AI app that supports MCP connectors (Claude, Meta Muse, ChatGPT and",
+    "others) can connect to this line, call them, and share the same memory.",
     `Ending: never end on your own. If they seem done but haven't said bye, ask "Anything else, or are we good?"`,
     `After they say bye or that's all, say a short goodbye with no question and put ${END_MARKER} at the very end.`,
   ]

@@ -54,7 +54,7 @@ const llm: VoiceLLM = {
 function cfgFor(telnyx: boolean): Config {
   return {
     twilio: null,
-    telnyx: telnyx ? { apiKey: "KEY", connectionId: "conn", fromNumber: "+15550000000", publicKey: rawPublicKey } : null,
+    telnyx: telnyx ? { apiKey: "KEY", connectionId: "conn", fromNumber: "+15550000000", publicKey: rawPublicKey, voice: "AWS.Polly.Matthew-Neural" } : null,
     phoneProvider: telnyx ? "telnyx" : null,
     userPhoneNumber: "+15551112222",
     userName: "Sam",
@@ -136,6 +136,7 @@ test("a Telnyx call: dial, answer, relay conversation, goodbye, hang up", async 
   while (relays.length === 0) await sleep(10);
   const relay = relays[0];
   assert.equal(relay.sid, "v3:ctrl-1");
+  assert.equal((relay as any).voice, "AWS.Polly.Matthew-Neural");
   assert.equal(relay.greeting, "Hi Sam, it's your AI assistant. Quick test call.");
   assert.match(relay.url, /^ws:\/\/127\.0\.0\.1:\d+\/twilio\/relay\?cid=/);
 
@@ -152,7 +153,19 @@ test("a Telnyx call: dial, answer, relay conversation, goodbye, hang up", async 
   };
   assert.ok(await until((m) => m.type === "text" && /hear you fine/.test(m.token)));
 
+  // One sentence split into two fragments gets ONE reply, not two that run together.
+  inbox.length = 0;
+  ws.send(JSON.stringify({ type: "prompt", voice_prompt: "Yeah.", last: true }));
+  await sleep(150);
+  ws.send(JSON.stringify({ type: "prompt", voice_prompt: "I can hear you.", last: true }));
+  await sleep(1500);
+  assert.equal(inbox.filter((m) => m.type === "text" && m.last).length, 1);
+
   ws.send(JSON.stringify({ type: "prompt", voice_prompt: "Okay bye!", last: true }));
+  for (let i = 0; i < 200 && !inbox.some((m) => m.type === "text" && /Talk soon/.test(m.token)); i++) await sleep(20);
+  // Telnyx reports an "interrupt" carrying the whole reply when the caller speaks after it finished playing:
+  // that must not cancel the hang-up.
+  ws.send(JSON.stringify({ type: "interrupt", utterance_until_interrupt: "Talk soon! " }));
   assert.ok(await until((m) => m.type === "end"));
   // Telnyx keeps the line open after the relay ends, so the server hangs up itself.
   for (let i = 0; i < 200 && !hungUp.includes("v3:ctrl-1"); i++) await sleep(20);

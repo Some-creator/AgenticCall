@@ -67,7 +67,14 @@ export interface Config {
   } | null;
   /** Telnyx credentials, or null when Telnyx isn't set up. */
   /** publicKey is optional: without it, webhooks are checked with a per-call secret in the webhook URL. */
-  telnyx: { apiKey: string; connectionId: string; fromNumber: string; publicKey: string | null } | null;
+  telnyx: {
+    apiKey: string;
+    connectionId: string;
+    fromNumber: string;
+    publicKey: string | null;
+    /** Text-to-speech voice for Telnyx calls, e.g. "Azure.en-US-BrianMultilingualNeural" or "AWS.Polly.Matthew-Neural". */
+    voice: string;
+  } | null;
   /** Which provider places calls; null means phone calls are off. */
   phoneProvider: "twilio" | "telnyx" | null;
   userPhoneNumber: string;
@@ -147,6 +154,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
         connectionId: required("TELNYX_CONNECTION_ID"),
         fromNumber: required("TELNYX_FROM_NUMBER"),
         publicKey: process.env.TELNYX_PUBLIC_KEY?.trim() || null,
+        voice: optional("TELNYX_VOICE", "Azure.en-US-BrianMultilingualNeural"),
       }
     : null;
   const wanted = process.env.PHONE_PROVIDER?.trim().toLowerCase();

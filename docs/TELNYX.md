@@ -33,6 +33,11 @@ TELNYX_FROM_NUMBER=+1...
 You can delete the `TWILIO_*` variables, or keep them: when Telnyx is set up it's used by default
 (`PHONE_PROVIDER=twilio` switches back). After redeploying, the logs should say `Phone calls via telnyx`.
 
+## Voice
+Set `TELNYX_VOICE` to pick the voice. The default is a natural male voice, `Azure.en-US-BrianMultilingualNeural`.
+Others: `AWS.Polly.Matthew-Neural` (male), `AWS.Polly.Joanna-Neural` or `Azure.en-US-Ava:DragonHDLatestNeural`
+(female). Telnyx may price providers differently; check their pricing page.
+
 ## Notes
 - Telnyx calls always use the real-time voice, so `ANTHROPIC_API_KEY` or `GROQ_API_KEY` must be set.
 - Texting (`send_sms`) isn't wired up for Telnyx yet; texts are skipped.
