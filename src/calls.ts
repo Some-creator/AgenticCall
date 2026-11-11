@@ -307,7 +307,8 @@ export class CallManager {
         url: `${this.cfg.publicBaseUrl}/twilio/voice?${q}`,
         statusCallback: `${this.cfg.publicBaseUrl}/twilio/status?${q}`,
         cid: id,
-        webhookUrl: `${this.cfg.publicBaseUrl}/telnyx/webhook`,
+        // The per-call secret lets the webhook be verified even without a Telnyx public key.
+        webhookUrl: `${this.cfg.publicBaseUrl}/telnyx/webhook?cid=${encodeURIComponent(id)}&token=${rec.relaySecret}`,
         machineDetection: this.cfg.answeringMachineDetection,
       });
       rec.sid = sid;
@@ -532,7 +533,13 @@ export class CallManager {
     await this.tel?.hangup(sid).catch((e) => log.warn(`hangup failed: ${(e as Error).message}`));
   }
 
-  /** A Telnyx call event (already signature-checked). */
+  /** Is this the secret we put in the webhook URL for this call? (Used when there's no Telnyx public key.) */
+  telnyxTokenValid(cid: string, token: string): boolean {
+    const rec = this.calls.get(cid);
+    return Boolean(rec && token && token === rec.relaySecret);
+  }
+
+  /** A Telnyx call event (already verified by signature or per-call token). */
   async onTelnyxEvent(body: unknown): Promise<void> {
     const ev = ((body as { data?: unknown })?.data ?? body) as {
       event_type?: string;

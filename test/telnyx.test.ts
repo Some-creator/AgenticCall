@@ -128,7 +128,7 @@ test("a Telnyx call: dial, answer, relay conversation, goodbye, hang up", async 
   const callP = client.callTool({ name: "call_user", arguments: { message: "Quick test call.", timeout_seconds: 15 } });
   while (dialed.length === 0) await sleep(10);
   const { cid, webhookUrl } = dialed[0];
-  assert.equal(webhookUrl, `${base}/telnyx/webhook`);
+  assert.ok(webhookUrl.startsWith(`${base}/telnyx/webhook?cid=`), webhookUrl);
   const client_state = Buffer.from(cid).toString("base64");
 
   assert.equal((await telnyxEvent("call.initiated", { call_control_id: "v3:ctrl-1", client_state })).status, 200);
@@ -167,6 +167,31 @@ test("a Telnyx call: dial, answer, relay conversation, goodbye, hang up", async 
   assert.equal(done.status, "completed");
   ws.close();
   await client.close();
+});
+
+test("without a Telnyx public key, webhooks are checked with the per-call URL secret", async () => {
+  const cfg = cfgFor(true);
+  cfg.telnyx!.publicKey = null;
+  const local: { cid: string; webhookUrl: string }[] = [];
+  const t2: Telephony = { ...tel, async createCall(o) { local.push({ cid: o.cid, webhookUrl: o.webhookUrl }); return { sid: "v3:ctrl-x" }; } };
+  const calls = new CallManager(cfg, t2, { llm });
+  const app = createApp(cfg, calls);
+  const s = await new Promise<Server>((r) => {
+    const x = app.listen(0, "127.0.0.1", () => r(x));
+  });
+  const url = `http://127.0.0.1:${(s.address() as AddressInfo).port}`;
+  cfg.publicBaseUrl = url;
+  await calls.startCall({ message: "hi" });
+  const hook = new URL(local[0].webhookUrl);
+  assert.equal(hook.pathname, "/telnyx/webhook");
+  const body = JSON.stringify({ data: { event_type: "call.initiated", payload: { call_control_id: "v3:ctrl-x" } } });
+  const post = (u: string) => fetch(u, { method: "POST", headers: { "content-type": "application/json" }, body });
+  assert.equal((await post(local[0].webhookUrl)).status, 200);
+  const wrong = new URL(local[0].webhookUrl);
+  wrong.searchParams.set("token", "nope");
+  assert.equal((await post(wrong.toString())).status, 403);
+  assert.equal((await post(`${url}/telnyx/webhook`)).status, 403);
+  s.close();
 });
 
 test("with no phone provider, calling fails with a clear message instead of crashing", async () => {

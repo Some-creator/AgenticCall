@@ -11,7 +11,7 @@ type TelnyxConfig = NonNullable<Config["telnyx"]>;
  * speech to the same real-time voice WebSocket the Twilio path uses.
  */
 export function telnyxTelephony(cfg: TelnyxConfig, maxCallSeconds: number): Telephony {
-  const client = new Telnyx({ apiKey: cfg.apiKey, publicKey: cfg.publicKey });
+  const client = new Telnyx({ apiKey: cfg.apiKey });
   return {
     provider: "telnyx",
     async createCall(o) {
@@ -50,20 +50,28 @@ export function telnyxTelephony(cfg: TelnyxConfig, maxCallSeconds: number): Tele
   };
 }
 
-/** POST /telnyx/webhook: call events from Telnyx, signature-checked with the account's public key. */
+/**
+ * POST /telnyx/webhook: call events from Telnyx. Verified with the account's public key (Ed25519 signature) when
+ * one is configured; otherwise with the per-call secret the server put in the webhook URL when dialing.
+ */
 export function telnyxRouter(cfg: TelnyxConfig, calls: CallManager): express.Router {
-  const verifier = new Telnyx({ apiKey: cfg.apiKey, publicKey: cfg.publicKey });
+  const verifier = new Telnyx({ apiKey: cfg.apiKey, ...(cfg.publicKey ? { publicKey: cfg.publicKey } : {}) });
   const r = express.Router();
   // The signature covers the exact raw body, so it must not be parsed first.
   r.post("/webhook", express.text({ type: "*/*", limit: "1mb" }), async (req: Request, res: Response) => {
+    const raw = String(req.body ?? "");
     let event: unknown;
     try {
-      event = await verifier.webhooks.unwrap(String(req.body ?? ""), {
-        headers: req.headers as Record<string, string>,
-      });
+      if (cfg.publicKey) {
+        event = await verifier.webhooks.unwrap(raw, { headers: req.headers as Record<string, string> });
+      } else {
+        const cid = String(req.query.cid ?? "");
+        if (!calls.telnyxTokenValid(cid, String(req.query.token ?? ""))) throw new Error("missing or wrong call token");
+        event = JSON.parse(raw);
+      }
     } catch (e) {
       log.warn(`rejected Telnyx webhook: ${(e as Error).message}`);
-      res.status(403).send("Invalid signature");
+      res.status(403).send("Forbidden");
       return;
     }
     res.status(200).end(); // acknowledge fast; Telnyx retries slow webhooks

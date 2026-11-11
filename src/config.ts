@@ -66,7 +66,8 @@ export interface Config {
     validateSignature: boolean;
   } | null;
   /** Telnyx credentials, or null when Telnyx isn't set up. */
-  telnyx: { apiKey: string; connectionId: string; fromNumber: string; publicKey: string } | null;
+  /** publicKey is optional: without it, webhooks are checked with a per-call secret in the webhook URL. */
+  telnyx: { apiKey: string; connectionId: string; fromNumber: string; publicKey: string | null } | null;
   /** Which provider places calls; null means phone calls are off. */
   phoneProvider: "twilio" | "telnyx" | null;
   userPhoneNumber: string;
@@ -145,7 +146,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
         apiKey: required("TELNYX_API_KEY"),
         connectionId: required("TELNYX_CONNECTION_ID"),
         fromNumber: required("TELNYX_FROM_NUMBER"),
-        publicKey: required("TELNYX_PUBLIC_KEY"),
+        publicKey: process.env.TELNYX_PUBLIC_KEY?.trim() || null,
       }
     : null;
   const wanted = process.env.PHONE_PROVIDER?.trim().toLowerCase();

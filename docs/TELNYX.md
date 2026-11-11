@@ -19,15 +19,16 @@ Menu names below may differ slightly in Telnyx's portal; the pieces you need are
 
 ## 3. Keys
 - **API key:** Account -> API Keys -> create one. That's `TELNYX_API_KEY`.
-- **Public key:** Account -> Keys & Credentials -> Public Key (used to check webhook signatures). That's
-  `TELNYX_PUBLIC_KEY`.
+- **Public key (optional):** Account -> Keys & Credentials -> Public Key. If one is shown, set it as
+  `TELNYX_PUBLIC_KEY` and webhooks are checked by signature. If it says "No key found", leave it out: each call's
+  webhook URL then carries a random per-call secret, and webhooks without it are rejected.
 
 ## 4. Railway variables
 ```env
 TELNYX_API_KEY=KEY...
 TELNYX_CONNECTION_ID=...
 TELNYX_FROM_NUMBER=+1...
-TELNYX_PUBLIC_KEY=...
+# TELNYX_PUBLIC_KEY=...   (optional)
 ```
 You can delete the `TWILIO_*` variables, or keep them: when Telnyx is set up it's used by default
 (`PHONE_PROVIDER=twilio` switches back). After redeploying, the logs should say `Phone calls via telnyx`.
