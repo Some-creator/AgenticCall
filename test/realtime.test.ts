@@ -29,7 +29,7 @@ let base = "";
 const dialed: { url: string; statusCallback: string }[] = [];
 const llmCalls: ChatMessage[][] = [];
 const llmTools: (boolean | undefined)[] = [];
-let flakyFailed = false;
+let flakyFailures = 0;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -73,8 +73,8 @@ const fakeLLM: VoiceLLM = {
       yield { type: "tool_call", call: { id: "tcx", type: "function", function: { name: "ask_agent", arguments: "{}" } } };
       return;
     }
-    if (lastMsg.role === "user" && last.includes("flaky") && !flakyFailed) {
-      flakyFailed = true;
+    if (messages.slice(-2).some((m) => m.content.toLowerCase().includes("flaky")) && flakyFailures < 2) {
+      flakyFailures++;
       throw Object.assign(new Error("rate limited"), { status: 429 });
     }
     if (messages.slice(-2).some((m) => m.content.toLowerCase().includes("flaky"))) {
@@ -511,7 +511,9 @@ test("natural turn-taking: no double greeting, no reply to 'okay', never hangs u
 
   // A model error (e.g. rate limit) doesn't end the call: it covers the gap and retries.
   tw.send({ type: "prompt", voicePrompt: "This is flaky", last: true });
+  // Fails twice in a row: "Sorry, one sec." is said once, the second retry is silent, then the real reply.
   assert.equal(await tw.reply(), "Sorry, one sec.");
+  assert.equal(await tw.reply(), "");
   assert.equal(await tw.reply(), "Okay, back. What were you saying?");
   await assert.rejects(tw.next((m) => m.type === "end", 500));
 

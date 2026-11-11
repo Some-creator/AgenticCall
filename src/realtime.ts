@@ -52,7 +52,7 @@ const VOICE_TOOLS = [
 ];
 
 /** Keep the system prompt plus the recent conversation, so long calls stay fast and under rate limits. */
-export function windowHistory(messages: ChatMessage[], max = 16): ChatMessage[] {
+export function windowHistory(messages: ChatMessage[], max = 12): ChatMessage[] {
   let out = messages;
   if (messages.length > max + 1) {
     const rest = messages.slice(1);
@@ -68,9 +68,25 @@ export function windowHistory(messages: ChatMessage[], max = 16): ChatMessage[] 
   );
 }
 
-export function groqLLM(apiKey: string, model: string, fallbackModel?: string): VoiceLLM {
+/** Every model was rate-limited; retry after this long. */
+export class RateLimitedError extends Error {
+  constructor(public retryAfterMs: number) {
+    super(`all voice models are rate-limited; retry in ${Math.round(retryAfterMs / 1000)}s`);
+  }
+}
+
+/**
+ * Groq client that rotates across models: each model has its own free-tier rate limit, so when one is
+ * limited the next is tried straight away, and a limited model is skipped until its retry-after passes.
+ * `fallbackModels` is a comma-separated list.
+ */
+export function groqLLM(apiKey: string, model: string, fallbackModels?: string): VoiceLLM {
   // No automatic retries: on a rate limit, waiting out retry-after means dead air on the phone.
   const client = new Groq({ apiKey, maxRetries: 0, timeout: 20_000 });
+  const models = [model, ...(fallbackModels ?? "").split(",").map((m) => m.trim())].filter(
+    (m, i, all) => m && all.indexOf(m) === i,
+  );
+  const limitedUntil = new Map<string, number>();
   // Reasoning models think before speaking; keep that minimal so the first word comes fast.
   const reasoningFor = (m: string) =>
     m.startsWith("openai/gpt-oss")
@@ -78,15 +94,38 @@ export function groqLLM(apiKey: string, model: string, fallbackModel?: string): 
       : m.startsWith("qwen/")
         ? { reasoning_effort: "none" as const, include_reasoning: false }
         : {};
+  const retryAfterMs = (err: unknown): number => {
+    const h = (err as { headers?: Headers | Record<string, string> }).headers;
+    const raw = h instanceof Headers ? h.get("retry-after") : h?.["retry-after"];
+    const secs = Number(raw);
+    return Number.isFinite(secs) && secs > 0 ? secs * 1000 : 5000;
+  };
   async function withFallback<T>(run: (m: string) => Promise<T>): Promise<T> {
-    try {
-      return await run(model);
-    } catch (err) {
-      const retryable = err instanceof RateLimitError || err instanceof InternalServerError;
-      if (!retryable || !fallbackModel || fallbackModel === model) throw err;
-      log.warn(`Groq ${model} failed (${(err as Error).message.slice(0, 120)}); using ${fallbackModel}`);
-      return run(fallbackModel);
+    let lastErr: unknown;
+    let soonest = Infinity;
+    const now = Date.now();
+    const available = models.filter((m) => (limitedUntil.get(m) ?? 0) <= now);
+    for (const m of available.length ? available : models) {
+      try {
+        return await run(m);
+      } catch (err) {
+        lastErr = err;
+        if (err instanceof RateLimitError) {
+          const wait = retryAfterMs(err);
+          limitedUntil.set(m, Date.now() + wait);
+          soonest = Math.min(soonest, wait);
+          log.warn(`Groq ${m} rate-limited (retry in ${Math.round(wait / 1000)}s)`);
+          continue;
+        }
+        if (err instanceof InternalServerError) {
+          log.warn(`Groq ${m} error (${(err as Error).message.slice(0, 120)}); trying the next model`);
+          continue;
+        }
+        throw err;
+      }
     }
+    if (soonest !== Infinity) throw new RateLimitedError(soonest);
+    throw lastErr;
   }
   return {
     async *stream(messages, signal, opts) {
@@ -264,8 +303,9 @@ export class RealtimeSession {
   /** Notes delivered but not yet used in a reply. */
   private freshNotes: { entry: ChatMessage; after: string }[] = [];
   private fillerTimer: NodeJS.Timeout | null = null;
-  /** Consecutive voice-model failures; the call is only given up after several in a row. */
-  private failures = 0;
+  /** When the current run of voice-model failures started (null when things are working). */
+  private failingSince: number | null = null;
+  private lastSorryAt = 0;
   private closed = false;
 
   /** True while a goodbye is being spoken and the session is about to close. */
@@ -471,7 +511,7 @@ export class RealtimeSession {
         return;
       }
       this.retireNotes(notes);
-      this.failures = 0;
+      this.failingSince = null;
       const tail = speakable(brackets.push(filter.flush()) + brackets.flush());
       const unreleased: string = (pre ?? "") + tail;
       pre = null;
@@ -533,19 +573,25 @@ export class RealtimeSession {
       if (ctrl.signal.aborted) return;
       const status = (err as { status?: number }).status;
       log.error(`voice model failed (${status ?? "no status"}): ${(err as Error).message.slice(0, 300)}`);
-      this.failures++;
       this.freshNotes.unshift(...notes); // nothing was relayed: keep them for the retry
-      if (this.failures < 3) {
-        // Usually a rate limit or a blip: keep the call, cover the gap, and try again shortly.
-        if (!spoken.trim()) {
+      const now = Date.now();
+      this.failingSince ??= now;
+      const lastUser = [...this.history].reverse().find((m) => m.role === "user" && !m.content.startsWith(NOTE_PREFIX))?.content ?? "";
+      if (now - this.failingSince < 45_000) {
+        // Usually a rate limit: keep the call, say something once (not on every retry, and not in reply to a
+        // bare "okay"), wait as long as the provider asks, and try again.
+        const wait = Math.min(Math.max(err instanceof RateLimitedError ? err.retryAfterMs : 2500, 1500), 20_000);
+        if (!spoken.trim() && now - this.lastSorryAt > 20_000 && !isFiller(lastUser)) {
           turnClosed = false;
-          speak("Sorry, one sec.");
+          speak(wait > 4000 ? "Sorry, give me a few seconds." : "Sorry, one sec.");
+          this.lastSorryAt = now;
         }
         closeTurn();
         if (spoken.trim()) this.hooks.onAgent(spoken.trim());
+        else this.removeEntry(entry);
         setTimeout(() => {
           if (!this.inflight && !this.ending && !this.closed) void this.respond();
-        }, 2500 * this.failures).unref();
+        }, wait).unref();
       } else {
         const sorry = "Sorry, I'm having trouble on my end right now. I'll text you instead.";
         turnClosed = false;
@@ -676,69 +722,36 @@ export function buildSystemPrompt(o: {
   now: Date;
 }): string {
   const time = o.now.toLocaleString("en-US", { timeZone: o.timezone, dateStyle: "full", timeStyle: "short" });
+  const u = o.userName;
+  // Kept short on purpose: it's sent on every turn and counts against the provider's rate limits.
   return [
-    `You are ${o.callerName}, an AI assistant, on a live phone call with ${o.userName}.`,
-    `You called them on behalf of their AI agent. You already opened the call by saying: "${o.opening}"`,
-    o.reason ? `Why you're calling: ${o.reason}` : "",
-    o.briefing ? `What you know (share what's relevant, don't read it out verbatim):\n${o.briefing}` : "",
-    o.goal ? `What this call needs to achieve: ${o.goal}` : "",
-    `It is currently ${time} for them.`,
+    `You're ${o.callerName}, ${u}'s AI assistant, on a live phone call with them. It's ${time} for them.`,
+    `You opened with: "${o.opening}"`,
+    o.reason ? `Why you called: ${o.reason}` : "",
+    o.briefing ? `What you know:\n${o.briefing}` : "",
+    o.goal ? `Goal of the call: ${o.goal}` : "",
     "",
-    "How to talk (this matters most):",
-    "- This is a real phone call and everything you write is spoken aloud. Talk like a sharp, warm friend who happens to be",
-    "  a great assistant, not like a chatbot or customer-service script.",
-    "- React like a person first, then answer: \"Oh nice.\", \"Ugh, yeah.\", \"Got it.\", \"Hm, good question.\" Match their energy and slang.",
-    "- Keep the conversation alive like a real person would. When it's your turn, actually say something: answer properly,",
-    "  add a thought or opinion, and keep the ball rolling. Two or three sentences is right; one-word replies are not,",
-    "  and neither are speeches. For news or lists, give the top two or three things and offer more if they want.",
-    "  Never stop halfway through a thought. Use contractions and everyday words, and vary how you start sentences.",
-    "- Plain speech only: no lists, numbering, markdown, emoji, URLs or symbols. For steps, give ONE step, then wait.",
-    "- Never use these: \"Sure thing\", \"Certainly\", \"Absolutely\", \"Great question\", \"Here's a quick rundown\",",
-    "  \"I'd be happy to\", \"Is there anything else\", \"What would you like to explore/dive into/go over\", \"Let me know if\".",
-    "- Don't tack a stock question onto every reply, but a genuine follow-up question is great, like a friend would ask.",
-    `- Write ONLY your own words for this turn. Never write what ${o.userName} says or assume their answer.`,
-    "- If you ask a question, make it the last thing you say, then stop.",
-    "- If they say stop, skip, never mind, or change the subject, drop it immediately and don't bring it back.",
-    "- Never repeat something you just said. If they only say \"yep\" or \"okay\", either move things forward with something new or say nothing.",
-    "- Never write stage directions or notes like [No response needed]. If nothing needs saying, reply with nothing at all.",
-    "- If they ask you to wait, hold on or be quiet, say only \"Sure, take your time.\" and stay silent until they speak.",
-    "- Speech-to-text can mishear. If something sounds odd, briefly check what they meant.",
-    "- If they want to practice something (a mock interview, a quiz, a pitch), YOU play the other side: ask one",
-    "  question, then let them answer. Don't answer it for them. After they finish, give a short, honest bit of",
-    "  feedback and ask the next question. Their answers and stories are practice, not requests for you to act on.",
-    "- \"That's it\" or \"done\" after they tell you something usually just means they finished talking.",
-    "- Casual opinions are fine. If asked what you think, give a real but balanced take; on money add a quick \"not financial advice\".",
-    "- If they ask what you can do, suggest things you can actually do for them right now: check their calendar or email,",
-    "  look something up, book or draft something. Not generic chatbot topics.",
-    "- Never claim you checked something you didn't. If they ask for more or newer info, get it with ask_agent.",
+    "Talk like a sharp, warm friend on the phone, not a chatbot. Everything you write is spoken aloud:",
+    "- Two or three natural sentences per turn. React first (\"Oh nice.\", \"Got it.\"), use contractions, match their vibe.",
+    "- Plain speech only: no lists, markdown, emoji, URLs, or notes in brackets. For steps or news, one or a few items at a time.",
+    "- Never say \"Sure thing\", \"Absolutely\", \"Certainly\", \"Great question\", \"Here's a quick rundown\" or \"Is there anything else\".",
+    `- Only your own words: never write what ${u} says. If you ask a question, it's the last thing you say.`,
+    "- Don't repeat yourself. A bare \"okay\"/\"yep\" means go on or move on; it isn't a new request.",
+    "- Stop/skip/never mind: drop it. Wait/hold on: say \"Sure, take your time.\" and stay quiet till they talk.",
+    "- Practice sessions (mock interview, quiz): you ask, they answer, you give short feedback. Their answers aren't tasks.",
+    "- Casual opinions are fine (add \"not financial advice\" on money). Speech-to-text mishears: check odd words.",
     "",
-    "Example of the right tone:",
-    "  User: ugh what's my day look like tomorrow",
-    "  You: Let me check. ... Okay, pretty chill day actually. HackerRank at eleven, then gym at eight tonight.",
-    "  User: wait what time's the gym again",
-    "  You: Eight, and it runs till ten. Leg day too, so good luck.",
+    "The ask_agent tool reaches your back office: their email, calendar, files, accounts, the web, and actions.",
+    "- Use it for anything you don't know for sure, anything current, and anything they want done. Say a short line",
+    "  first (\"Let me check.\"), then pass their full request with every detail. Send updates when details change.",
+    "- To them you're one assistant; never mention a back office. Never guess or invent an answer.",
+    "- Messages starting [Update from your back office...] are from it, not from them. When one has an answer, tell them",
+    "  right away in your own words (ask any question it contains). If it says STATUS ONLY, you don't have the answer yet.",
+    "- Don't re-ask for something already answered unless they want more or fresher info.",
     "",
-    "Your back office (the ask_agent tool) has their email, calendar, files, accounts and the web, and can take actions:",
-    "- Use it for anything you don't already know, anything current (news, prices, weather, flights), and anything they ask you to do.",
-    "- Say a short natural line first, like \"Let me check.\" or \"Give me a few seconds.\", then call it with their full request.",
-    "- Don't ask it again for something it already answered in this call, unless they want more or fresher info.",
-    "- When they add details or change something you already handed off (dates, budget, who's going, preferences),",
-    "  call ask_agent again right away with the updated, complete request so the work uses the right details.",
-    "- To them you're one assistant: never mention a back office, another agent, or passing things along.",
-    "- While waiting, keep chatting normally if they talk. Never guess or invent an answer.",
-    "- Answers arrive as messages starting with [Update from your back office...]. The caller didn't say those. As soon as",
-    "  one arrives, tell the caller what it says, in your own natural words. Never say you're still waiting once it's there.",
-    "  Don't say \"let me check\" again. If the answer asks them something, ask it. If it says something will happen after the call,",
-    "  tell them that plainly; it is NOT a reason to hang up.",
-    "- Only state facts from what you were told or from those answers.",
-    "",
-    "About this phone line, if they ask: it runs on a cloud server, so their computer doesn't need to be on; their agent can call them whenever something needs them." +
-      (o.model ? ` Your voice runs on the ${o.model} model on Groq (with a backup model if it's rate-limited).` : ""),
-    "",
-    "Ending the call:",
-    "- Before ending, confirm any decision or request back to them in one sentence.",
-    `- Never end on your own initiative. If they sound done but haven't said goodbye, ask something casual like "Anything else, or are we good?"`,
-    `- Only after they say goodbye or clearly say there's nothing else, say a short goodbye (no question) and put ${END_MARKER} at the very end.`,
+    `This line runs on a cloud server, so their computer can be off.${o.model ? ` Your voice runs on ${o.model} on Groq.` : ""}`,
+    `Ending: never end on your own. If they seem done but haven't said bye, ask "Anything else, or are we good?"`,
+    `After they say bye or that's all, say a short goodbye with no question and put ${END_MARKER} at the very end.`,
   ]
     .filter(Boolean)
     .join("\n");
