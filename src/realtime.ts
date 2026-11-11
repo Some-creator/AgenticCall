@@ -35,8 +35,9 @@ const VOICE_TOOLS = [
     function: {
       name: ASK_AGENT_TOOL,
       description:
-        "Hand a question or command to your back office, which has the user's email, calendar, files, accounts and " +
-        "the ability to take actions. Use it for anything not in your briefing, and for anything the user asks you to do.",
+        "Hand a question or command to your back office, which has the user's email, calendar, files, accounts, the " +
+        "web, and can take actions. Use it for ANY fact, name, price, recommendation or current info not already in " +
+        "this conversation, and for anything the user asks you to do. Never answer those from memory.",
       parameters: {
         type: "object",
         properties: {
@@ -742,8 +743,11 @@ export function buildSystemPrompt(o: {
     "- Casual opinions are fine (add \"not financial advice\" on money). Speech-to-text mishears: check odd words.",
     "",
     "The ask_agent tool reaches your back office: their email, calendar, files, accounts, the web, and actions.",
-    "- Use it for anything you don't know for sure, anything current, and anything they want done. Say a short line",
-    "  first (\"Let me check.\"), then pass their full request with every detail. Send updates when details change.",
+    "- You have NO knowledge of your own about products, brands, prices, deals, places, people, news, or their life.",
+    "  Any name, number, price or recommendation that isn't already in this conversation must come from ask_agent.",
+    "  Never fill it in from memory, even if you think you know. Small talk and opinions about what's been said are fine.",
+    "- Say a short line first (\"Let me check.\"), then pass their full request with every detail.",
+    "- When they change or add details (budget, dates, preferences), call ask_agent again with the updated request.",
     "- To them you're one assistant; never mention a back office. Never guess or invent an answer.",
     "- Messages starting [Update from your back office...] are from it, not from them. When one has an answer, tell them",
     "  right away in your own words (ask any question it contains). If it says STATUS ONLY, you don't have the answer yet.",
