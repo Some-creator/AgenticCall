@@ -278,6 +278,8 @@ export interface SessionHooks {
   onWrapUp(): void;
   /** Something worth keeping in the call log (e.g. a voice-model error). */
   onNote?(text: string): void;
+  /** The session sent its end frame (the goodbye has been spoken). */
+  onEnded?(): void;
 }
 
 /** Information handed to the voice model mid-call. `after` replaces it once it has been used ("" removes it). */
@@ -401,11 +403,19 @@ export class RealtimeSession {
     });
   }
 
+  private framesLogged = 0;
+
   handle(msg: Record<string, unknown>): void {
+    // Log the shape (not the content) of the first few frames, to spot provider differences quickly.
+    if (this.framesLogged < 4) {
+      this.framesLogged++;
+      log.info(`relay frame: type=${String(msg.type)} keys=${Object.keys(msg).join(",")}`);
+    }
     switch (msg.type) {
       case "prompt": {
         if (msg.last === false) return; // only act on the final transcript of a turn
-        const text = String(msg.voicePrompt ?? "").trim();
+        // Twilio sends voicePrompt; accept the snake_case spelling too.
+        const text = String(msg.voicePrompt ?? msg.voice_prompt ?? "").trim();
         if (!text || this.ending) return;
         if (this.fillerTimer) clearTimeout(this.fillerTimer);
         this.fillerTimer = null;
@@ -427,7 +437,7 @@ export class RealtimeSession {
       }
       case "interrupt": {
         this.inflight?.abort();
-        const heard = String(msg.utteranceUntilInterrupt ?? "");
+        const heard = String(msg.utteranceUntilInterrupt ?? msg.utterance_until_interrupt ?? "");
         const last = this.history.at(-1);
         // Keep only what the caller actually heard, so the model doesn't think it said more.
         if (last?.role === "assistant" && !last.tool_calls) last.content = heard ? `${heard}…` : "…";
@@ -720,6 +730,7 @@ export class RealtimeSession {
     this.endTimer = setTimeout(() => {
       this.endTimer = null;
       this.send({ type: "end", handoffData: JSON.stringify({ reason: "conversation_complete" }) });
+      this.hooks.onEnded?.();
     }, speechMs(lastSpoken));
     this.endTimer.unref();
   }

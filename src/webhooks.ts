@@ -6,21 +6,22 @@ import { log } from "./log.js";
 
 /** Express router for Twilio voice webhooks: /twilio/voice, /twilio/gather, /twilio/hold, /twilio/status. */
 export function twilioRouter(cfg: Config, calls: CallManager): express.Router {
+  const tw = cfg.twilio!; // only mounted when Twilio is set up
   const r = express.Router();
   r.use(express.urlencoded({ extended: false }));
 
   // Reject anything not signed by Twilio with our auth token.
   r.use((req: Request, res: Response, next: NextFunction) => {
-    if (!cfg.twilio.validateSignature) return next();
+    if (!tw.validateSignature) return next();
     const signature = req.header("X-Twilio-Signature") ?? "";
     const params = (req.body ?? {}) as Record<string, string>;
     const expectedUrl = cfg.publicBaseUrl + req.originalUrl;
-    if (signature && twilio.validateRequest(cfg.twilio.authToken, signature, expectedUrl, params)) return next();
+    if (signature && twilio.validateRequest(tw.authToken, signature, expectedUrl, params)) return next();
 
     // Fall back to the URL as the proxy saw it, in case PUBLIC_BASE_URL differs from the real host.
     const proto = (req.header("x-forwarded-proto") ?? req.protocol).split(",")[0].trim();
     const seenUrl = `${proto}://${req.header("host")}${req.originalUrl}`;
-    if (signature && seenUrl !== expectedUrl && twilio.validateRequest(cfg.twilio.authToken, signature, seenUrl, params)) {
+    if (signature && seenUrl !== expectedUrl && twilio.validateRequest(tw.authToken, signature, seenUrl, params)) {
       log.warn(`Twilio webhook matched ${seenUrl}, not PUBLIC_BASE_URL ${cfg.publicBaseUrl}; set PUBLIC_BASE_URL to match.`);
       return next();
     }

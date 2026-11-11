@@ -151,6 +151,7 @@ const fakeLLM: VoiceLLM = {
 };
 
 const tel: Telephony = {
+  provider: "twilio",
   async createCall(o) {
     dialed.push(o);
     return { sid: `CA${dialed.length}` };
@@ -164,6 +165,8 @@ const tel: Telephony = {
 before(async () => {
   const cfg = {
     twilio: { accountSid: "AC123", authToken: AUTH, fromNumber: "+15550000000", validateSignature: true },
+    telnyx: null,
+    phoneProvider: "twilio",
     userPhoneNumber: "+15551112222",
     userName: "Sam",
     publicBaseUrl: "",

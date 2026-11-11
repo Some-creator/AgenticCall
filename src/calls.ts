@@ -104,22 +104,33 @@ interface CallRecord {
   listeners: Set<() => void>;
 }
 
-/** Thin seam over the Twilio REST API so the call logic can be tested without network access. */
+/** Thin seam over the phone provider's API so the call logic can be tested without network access. */
 export interface Telephony {
+  provider: "twilio" | "telnyx";
   createCall(opts: {
     to: string;
     from: string;
+    /** Twilio: TwiML webhook and status callback. */
     url: string;
     statusCallback: string;
     machineDetection: boolean;
+    /** Telnyx: our call id (sent as client_state) and the events webhook. */
+    cid: string;
+    webhookUrl: string;
   }): Promise<{ sid: string }>;
   hangup(sid: string): Promise<void>;
   sendSms(opts: { to: string; from: string; body: string }): Promise<{ sid: string }>;
+  /** Telnyx: start Conversation Relay on an answered call. */
+  startRelay?(
+    sid: string,
+    opts: { url: string; greeting: string; language: string; customParameters: Record<string, string> },
+  ): Promise<void>;
 }
 
-export function twilioTelephony(cfg: Config): Telephony {
-  const client = twilio(cfg.twilio.accountSid, cfg.twilio.authToken);
+export function twilioTelephony(cfg: NonNullable<Config["twilio"]>): Telephony {
+  const client = twilio(cfg.accountSid, cfg.authToken);
   return {
+    provider: "twilio",
     async createCall(o) {
       const call = await client.calls.create({
         to: o.to,
@@ -201,7 +212,7 @@ export class CallManager {
 
   constructor(
     private cfg: Config,
-    private tel: Telephony,
+    private tel: Telephony | null,
     opts: { llm?: VoiceLLM; now?: () => number; memory?: MemoryStore } = {},
   ) {
     this.llm = opts.llm;
@@ -221,7 +232,14 @@ export class CallManager {
     goal?: string;
   }): Promise<CallRecord> {
     const urgency = input.urgency ?? "normal";
-    const mode = input.mode ?? this.cfg.defaultMode;
+    if (!this.tel) {
+      throw new CallError(
+        "Phone calls are turned off on this server right now (no Twilio or Telnyx account is set up). " +
+          "Tell the user in chat instead.",
+      );
+    }
+    // Telnyx calls always use the real-time voice.
+    const mode = this.tel.provider === "telnyx" ? "realtime" : (input.mode ?? this.cfg.defaultMode);
     if (mode === "realtime" && !this.llm) {
       throw new CallError(
         'Real-time mode is not configured on this server (no ANTHROPIC_API_KEY or GROQ_API_KEY). Use mode "turn_by_turn".',
@@ -285,17 +303,19 @@ export class CallManager {
     try {
       const { sid } = await this.tel.createCall({
         to: this.cfg.userPhoneNumber,
-        from: this.cfg.twilio.fromNumber,
+        from: this.fromNumber(),
         url: `${this.cfg.publicBaseUrl}/twilio/voice?${q}`,
         statusCallback: `${this.cfg.publicBaseUrl}/twilio/status?${q}`,
+        cid: id,
+        webhookUrl: `${this.cfg.publicBaseUrl}/telnyx/webhook`,
         machineDetection: this.cfg.answeringMachineDetection,
       });
       rec.sid = sid;
-      log.info(`call ${id} dialing (twilio sid ${sid}), urgency=${urgency}, mode=${mode}`);
+      log.info(`call ${id} dialing (${this.tel.provider} id ${sid}), urgency=${urgency}, mode=${mode}`);
     } catch (err) {
       rec.status = "failed";
       rec.endedAt = this.now();
-      throw new CallError(`Twilio refused to place the call: ${(err as Error).message}`);
+      throw new CallError(`${this.tel.provider} refused to place the call: ${(err as Error).message}`);
     }
     return rec;
   }
@@ -363,7 +383,7 @@ export class CallManager {
       await this.waitFor(rec, () => TERMINAL.has(rec.status), 20_000);
     }
     if (!TERMINAL.has(rec.status) && rec.sid) {
-      await this.tel.hangup(rec.sid).catch((e) => log.warn(`hangup failed: ${e.message}`));
+      await this.hangupSid(rec.sid);
       this.setStatus(rec, "canceled");
     }
     await this.waitFor(rec, () => !rec.summarizing, 15_000);
@@ -504,6 +524,73 @@ export class CallManager {
     };
   }
 
+  private fromNumber(): string {
+    return (this.tel?.provider === "telnyx" ? this.cfg.telnyx?.fromNumber : this.cfg.twilio?.fromNumber) ?? "";
+  }
+
+  private async hangupSid(sid: string): Promise<void> {
+    await this.tel?.hangup(sid).catch((e) => log.warn(`hangup failed: ${(e as Error).message}`));
+  }
+
+  /** A Telnyx call event (already signature-checked). */
+  async onTelnyxEvent(body: unknown): Promise<void> {
+    const ev = ((body as { data?: unknown })?.data ?? body) as {
+      event_type?: string;
+      payload?: { call_control_id?: string; client_state?: string; hangup_cause?: string };
+    };
+    const p = ev?.payload ?? {};
+    let cid = "";
+    try {
+      cid = Buffer.from(p.client_state ?? "", "base64").toString("utf8");
+    } catch {
+      /* not ours */
+    }
+    const rec = this.calls.get(cid) ?? [...this.calls.values()].find((r) => r.sid && r.sid === p.call_control_id);
+    if (!rec) return;
+    switch (ev.event_type) {
+      case "call.answered": {
+        if (TERMINAL.has(rec.status)) return;
+        rec.answeredAt = this.now();
+        this.setStatus(rec, "in_progress");
+        this.armMaxDuration(rec);
+        try {
+          await this.tel?.startRelay?.(p.call_control_id ?? rec.sid ?? "", {
+            url: relayUrl(this.cfg, rec.id),
+            greeting: rec.opening,
+            language: this.cfg.language,
+            customParameters: { cid: rec.id, secret: rec.relaySecret },
+          });
+        } catch (e) {
+          log.error(`call ${rec.id}: couldn't start Telnyx Conversation Relay: ${(e as Error).message}`);
+          rec.transcript.push(this.turn("system", `Real-time voice failed to start: ${(e as Error).message}`));
+          if (rec.sid) await this.hangupSid(rec.sid);
+        }
+        return;
+      }
+      case "call.conversation.start_failed":
+        log.error(`call ${rec.id}: Telnyx Conversation Relay failed to start`);
+        rec.transcript.push(this.turn("system", "Real-time voice failed to start (Telnyx)."));
+        if (rec.sid) await this.hangupSid(rec.sid);
+        return;
+      case "call.hangup": {
+        const cause = p.hangup_cause ?? "";
+        const status: CallStatus =
+          cause === "user_busy"
+            ? "busy"
+            : ["no_answer", "timeout", "call_rejected", "originator_cancel"].includes(cause) && !rec.answeredAt
+              ? "no_answer"
+              : cause === "normal_clearing" || cause === "time_limit" || rec.answeredAt
+                ? "completed"
+                : "failed";
+        this.setStatus(rec, status);
+        if (status === "no_answer" || status === "busy") void this.smsFallback(rec);
+        return;
+      }
+      default:
+        return;
+    }
+  }
+
   /** An answer arrived after the user hung up: call them back with it (or text it if a call isn't allowed now). */
   private async callBack(prev: CallRecord, reqs: AgentRequest[], answer: string): Promise<WaitResult> {
     for (const r of reqs) {
@@ -596,9 +683,10 @@ export class CallManager {
   }
 
   async sendSms(body: string): Promise<string> {
+    if (!this.tel) throw new CallError("Texting is turned off (no phone provider is set up).");
     const { sid } = await this.tel.sendSms({
       to: this.cfg.userPhoneNumber,
-      from: this.cfg.twilio.fromNumber,
+      from: this.fromNumber(),
       body,
     });
     return sid;
@@ -687,11 +775,13 @@ export class CallManager {
 
   /** The relay WebSocket connected and sent its "setup" message. */
   attachRelay(ws: WebSocket, setup: Record<string, unknown>, query: URLSearchParams): boolean {
-    const params = (setup.customParameters ?? {}) as Record<string, string>;
+    // Twilio and Telnyx name these fields slightly differently.
+    const params = (setup.customParameters ?? setup.custom_parameters ?? {}) as Record<string, string>;
+    const callId = setup.callSid ?? setup.call_control_id ?? setup.callControlId;
     const rec = this.calls.get(params.cid ?? query.get("cid") ?? "");
     if (!rec || rec.mode !== "realtime" || TERMINAL.has(rec.status) || rec.session) return false;
-    // Only Twilio knows the per-call secret (it came in TwiML over a signed webhook) or the call SID.
-    const ok = params.secret ? params.secret === rec.relaySecret : Boolean(rec.sid) && setup.callSid === rec.sid;
+    // Only the provider knows the per-call secret (it came over a signed webhook/API call) or the call id.
+    const ok = params.secret ? params.secret === rec.relaySecret : Boolean(rec.sid) && callId === rec.sid;
     if (!ok) return false;
 
     const llm = this.llm!;
@@ -751,6 +841,13 @@ export class CallManager {
         rec.transcript.push(this.turn("system", `Remembered: ${fact}`));
         log.info(`call ${rec.id}: remembered "${fact}"`);
       },
+      onEnded: () => {
+        // Telnyx keeps the line open after the relay ends, so hang up once the goodbye has been spoken.
+        if (this.tel?.provider === "telnyx" && rec.sid) {
+          const sid = rec.sid;
+          setTimeout(() => void this.hangupSid(sid), 1500).unref();
+        }
+      },
       onNote: (text) => {
         rec.transcript.push(this.turn("system", text));
       },
@@ -761,7 +858,7 @@ export class CallManager {
         // Safety net: if Twilio doesn't end the call after the goodbye, hang up ourselves.
         setTimeout(() => {
           if (!TERMINAL.has(rec.status) && rec.sid && rec.session?.isEnding) {
-            void this.tel.hangup(rec.sid).catch((e) => log.warn(`hangup failed: ${e.message}`));
+            void this.hangupSid(rec.sid);
           }
         }, 20_000).unref();
       },
@@ -961,7 +1058,7 @@ export class CallManager {
       if (TERMINAL.has(rec.status)) return;
       log.warn(`call ${rec.id} hit MAX_CALL_SECONDS (${this.cfg.maxCallSeconds}s); hanging up`);
       rec.transcript.push(this.turn("system", "Maximum call length reached; hung up."));
-      if (rec.sid) void this.tel.hangup(rec.sid).catch((e) => log.warn(`hangup failed: ${e.message}`));
+      if (rec.sid) void this.hangupSid(rec.sid);
       this.setStatus(rec, "completed");
     }, this.cfg.maxCallSeconds * 1000);
     timer.unref();

@@ -74,7 +74,12 @@ to write for speech (short sentences, no markdown) and how to run the conversati
 
 ---
 
-## 1. Twilio setup
+## 1. Phone provider
+
+Telnyx is cheaper and recommended: see [`docs/TELNYX.md`](docs/TELNYX.md). Twilio setup is below. Both are
+optional; with neither set up, the server runs but calls are turned off.
+
+### Twilio setup
 
 1. Create an account at [twilio.com](https://www.twilio.com) and buy a **voice-capable phone number**.
 2. From the Console dashboard, copy your **Account SID** and **Auth Token**.

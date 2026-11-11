@@ -5,6 +5,7 @@ import type { Config } from "./config.js";
 import type { CallManager } from "./calls.js";
 import { buildMcpServer } from "./tools.js";
 import { twilioRouter } from "./webhooks.js";
+import { telnyxRouter } from "./telnyx.js";
 import { log } from "./log.js";
 
 function safeEqual(a: string, b: string): boolean {
@@ -29,7 +30,8 @@ export function createApp(cfg: Config, calls: CallManager): express.Express {
   const app = express();
   app.set("trust proxy", true);
   app.get("/", (_req, res) => res.json({ ok: true, name: "agentic-call" }));
-  app.use("/twilio", twilioRouter(cfg, calls));
+  if (cfg.twilio) app.use("/twilio", twilioRouter(cfg, calls));
+  if (cfg.telnyx) app.use("/telnyx", telnyxRouter(cfg.telnyx, calls));
 
   if (cfg.transport === "http") {
     app.post("/mcp", mcpAuth(cfg), express.json({ limit: "1mb" }), async (req, res) => {

@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { loadConfig } from "./config.js";
-import { CallManager, twilioTelephony } from "./calls.js";
+import { CallManager, twilioTelephony, type Telephony } from "./calls.js";
+import { telnyxTelephony } from "./telnyx.js";
 import { buildMcpServer } from "./tools.js";
 import { createApp } from "./app.js";
 import { attachRelayServer, groqLLM, logGroqModels, type VoiceLLM } from "./realtime.js";
@@ -24,14 +25,24 @@ async function main() {
   const llm: VoiceLLM | undefined =
     claude && groq ? withBackup(claude, groq, [cfg.anthropic.model, `Groq ${cfg.groq.model}`]) : (claude ?? groq);
   const memory = new MemoryStore(cfg.memoryFile);
-  const calls = new CallManager(cfg, twilioTelephony(cfg), { llm, memory });
+  const tel: Telephony | null =
+    cfg.phoneProvider === "telnyx" && cfg.telnyx
+      ? telnyxTelephony(cfg.telnyx, cfg.maxCallSeconds)
+      : cfg.phoneProvider === "twilio" && cfg.twilio
+        ? twilioTelephony(cfg.twilio)
+        : null;
+  const calls = new CallManager(cfg, tel, { llm, memory });
   const app = createApp(cfg, calls);
   const server = await new Promise<import("node:http").Server>((resolve) => {
     const s = app.listen(cfg.port, cfg.host, () => resolve(s));
   });
   attachRelayServer(server, calls);
   if (cfg.groq.apiKey) void logGroqModels(cfg.groq.apiKey);
-  log.info(`Twilio webhooks at ${cfg.publicBaseUrl}/twilio/* (listening on ${cfg.host}:${cfg.port})`);
+  log.info(
+    tel
+      ? `Phone calls via ${tel.provider} (listening on ${cfg.host}:${cfg.port})`
+      : `Phone calls are OFF: no Twilio or Telnyx account set up (listening on ${cfg.host}:${cfg.port})`,
+  );
   log.info(
     cfg.defaultMode === "realtime"
       ? `Real-time voice: ${claude ? `${cfg.anthropic.model}${groq ? ` (backup: Groq ${cfg.groq.model})` : ""}` : `Groq ${cfg.groq.model}`}`

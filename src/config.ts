@@ -58,12 +58,17 @@ function parseQuietHours(raw: string | undefined): QuietHours | null {
 }
 
 export interface Config {
+  /** Twilio credentials, or null when Twilio isn't set up. */
   twilio: {
     accountSid: string;
     authToken: string;
     fromNumber: string;
     validateSignature: boolean;
-  };
+  } | null;
+  /** Telnyx credentials, or null when Telnyx isn't set up. */
+  telnyx: { apiKey: string; connectionId: string; fromNumber: string; publicKey: string } | null;
+  /** Which provider places calls; null means phone calls are off. */
+  phoneProvider: "twilio" | "telnyx" | null;
   userPhoneNumber: string;
   userName: string;
   publicBaseUrl: string;
@@ -126,13 +131,36 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     console.error(`WARN  PUBLIC_BASE_URL "${rawBase}" normalised to "${publicBaseUrl}"`);
   }
 
+  // Phone providers are optional: set up Twilio, Telnyx, or neither (then calls are off until one is added).
+  const twilio = process.env.TWILIO_ACCOUNT_SID?.trim()
+    ? {
+        accountSid: required("TWILIO_ACCOUNT_SID"),
+        authToken: required("TWILIO_AUTH_TOKEN"),
+        fromNumber: required("TWILIO_FROM_NUMBER"),
+        validateSignature: bool("TWILIO_VALIDATE_SIGNATURE", true),
+      }
+    : null;
+  const telnyx = process.env.TELNYX_API_KEY?.trim()
+    ? {
+        apiKey: required("TELNYX_API_KEY"),
+        connectionId: required("TELNYX_CONNECTION_ID"),
+        fromNumber: required("TELNYX_FROM_NUMBER"),
+        publicKey: required("TELNYX_PUBLIC_KEY"),
+      }
+    : null;
+  const wanted = process.env.PHONE_PROVIDER?.trim().toLowerCase();
+  if (wanted && wanted !== "twilio" && wanted !== "telnyx") {
+    throw new Error(`PHONE_PROVIDER must be "twilio" or "telnyx", got "${wanted}"`);
+  }
+  if (wanted === "twilio" && !twilio) throw new Error("PHONE_PROVIDER=twilio but TWILIO_ACCOUNT_SID isn't set");
+  if (wanted === "telnyx" && !telnyx) throw new Error("PHONE_PROVIDER=telnyx but TELNYX_API_KEY isn't set");
+  const phoneProvider: "twilio" | "telnyx" | null =
+    (wanted as "twilio" | "telnyx" | undefined) ?? (telnyx ? "telnyx" : twilio ? "twilio" : null);
+
   return {
-    twilio: {
-      accountSid: required("TWILIO_ACCOUNT_SID"),
-      authToken: required("TWILIO_AUTH_TOKEN"),
-      fromNumber: required("TWILIO_FROM_NUMBER"),
-      validateSignature: bool("TWILIO_VALIDATE_SIGNATURE", true),
-    },
+    twilio,
+    telnyx,
+    phoneProvider,
     userPhoneNumber: required("USER_PHONE_NUMBER"),
     userName: optional("USER_NAME", "there"),
     publicBaseUrl,
