@@ -6,6 +6,7 @@ import { buildMcpServer } from "./tools.js";
 import { createApp } from "./app.js";
 import { attachRelayServer, groqLLM, logGroqModels, type VoiceLLM } from "./realtime.js";
 import { anthropicLLM, withBackup } from "./anthropic.js";
+import { MemoryStore } from "./memory.js";
 import { log } from "./log.js";
 
 async function main() {
@@ -22,7 +23,8 @@ async function main() {
   const claude = cfg.anthropic.apiKey ? anthropicLLM(cfg.anthropic.apiKey, cfg.anthropic.model) : undefined;
   const llm: VoiceLLM | undefined =
     claude && groq ? withBackup(claude, groq, [cfg.anthropic.model, `Groq ${cfg.groq.model}`]) : (claude ?? groq);
-  const calls = new CallManager(cfg, twilioTelephony(cfg), { llm });
+  const memory = new MemoryStore(cfg.memoryFile);
+  const calls = new CallManager(cfg, twilioTelephony(cfg), { llm, memory });
   const app = createApp(cfg, calls);
   const server = await new Promise<import("node:http").Server>((resolve) => {
     const s = app.listen(cfg.port, cfg.host, () => resolve(s));

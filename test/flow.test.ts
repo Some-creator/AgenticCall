@@ -59,6 +59,7 @@ before(async () => {
     callbackThresholdSeconds: 60,
     groq: { apiKey: null, model: "test", fallbackModel: "test" },
     anthropic: { apiKey: null, model: "test" },
+    memoryFile: null,
     relay: {},
   };
   const calls = new CallManager(cfg, fakeTel);
@@ -110,7 +111,7 @@ test("rejects unsigned Twilio webhooks", async () => {
 test("full two-way conversation", async () => {
   const client = await mcpClient();
   const tools = (await client.listTools()).tools.map((t) => t.name).sort();
-  assert.deepEqual(tools, ["acknowledge_request", "answer_on_call", "call_user", "end_call", "get_call", "list_calls", "say_on_call", "send_sms", "wait_for_reply"]);
+  assert.deepEqual(tools, ["acknowledge_request", "answer_on_call", "call_user", "end_call", "forget", "get_call", "list_calls", "recall", "remember", "say_on_call", "send_sms", "wait_for_reply"]);
 
   const callP = client.callTool({
     name: "call_user",

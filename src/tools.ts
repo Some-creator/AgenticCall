@@ -9,6 +9,10 @@ you, naturally, like a person. Give call_user a clear opening message, a briefin
 ask about, and the goal (what you need decided or learned). Then call wait_for_reply until the call ends; you
 get a summary, the user's decisions and follow-ups, and the transcript. Act on them afterwards.
 
+Shared memory: the voice assistant remembers facts about the user across calls and saves new ones it hears.
+Use recall to see them (handy before writing a briefing and after a call), remember to add facts you know
+(preferences, budgets, routines), and forget to remove wrong ones.
+
 During a real-time call you stay on the line in the background: keep calling wait_for_reply in a loop.
 When a result contains agent_requests, the user just asked something only you can answer or do (check
 email, look at the calendar, send a message, ...). They are on the phone waiting, so handle it IMMEDIATELY
@@ -250,6 +254,51 @@ export function buildMcpServer(calls: CallManager): McpServer {
             return { ...summary, turns: transcript.length };
           }),
       ),
+  );
+
+  server.registerTool(
+    "remember",
+    {
+      title: "Remember something about the user",
+      description:
+        "Save a short fact about the user to the memory shared with the voice assistant, so it knows it on every " +
+        "future call (e.g. \"Budget for cologne is $30-50\", \"Has the gym at 8pm on weekdays\").",
+      inputSchema: { fact: z.string().min(1).max(300).describe("One short fact, in the third person.") },
+      annotations: { destructiveHint: false },
+    },
+    async ({ fact }) =>
+      guard(async () => {
+        if (!calls.memory) throw new CallError("Memory is turned off on this server (MEMORY_FILE=off).");
+        return calls.memory.add(fact, "agent");
+      }),
+  );
+
+  server.registerTool(
+    "recall",
+    {
+      title: "What the voice assistant remembers",
+      description:
+        "List the saved facts about the user, including ones the voice assistant picked up on calls. Check this " +
+        "before calling to brief yourself, and after calls to learn what it noted.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true },
+    },
+    async () => guard(async () => ({ notes: calls.memory?.list() ?? [] })),
+  );
+
+  server.registerTool(
+    "forget",
+    {
+      title: "Forget a saved fact",
+      description: "Delete a saved fact by its id (from recall), e.g. when it's wrong or out of date.",
+      inputSchema: { id: z.string().describe("The note id from recall.") },
+      annotations: { destructiveHint: true },
+    },
+    async ({ id }) =>
+      guard(async () => {
+        if (!calls.memory?.remove(id)) throw new CallError(`No saved fact with id ${id}.`);
+        return { forgotten: id };
+      }),
   );
 
   server.registerTool(

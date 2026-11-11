@@ -64,6 +64,7 @@ your agent handles it with its own tools, and the voice tells you the answer. Me
 | `wait_for_reply` | Keeps listening if a result came back with `still_waiting: true`, for example while the phone is still ringing. |
 | `answer_on_call` | Real-time calls: answers a question or command you gave mid-call; the voice tells you right away. |
 | `acknowledge_request` | Real-time calls: the agent's quick time estimate. Short waits keep you on the line; long ones offer a call back. |
+| `remember` / `recall` / `forget` | Shared long-term memory: facts about you that the voice saves on calls and loads into every future call. |
 | `end_call` | Says goodbye, hangs up, and returns the transcript. |
 | `get_call` / `list_calls` | Return call status and transcripts. |
 | `send_sms` | Texts you for things that don't need a call, or as a summary after one. |

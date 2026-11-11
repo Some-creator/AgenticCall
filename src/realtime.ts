@@ -28,6 +28,10 @@ export interface VoiceLLM {
 }
 
 export const ASK_AGENT_TOOL = "ask_agent";
+export const REMEMBER_TOOL = "remember";
+export const REMEMBER_DESCRIPTION =
+  "Save a short fact about the user for future calls: a preference, dislike, budget, routine, person, or plan they " +
+  "mentioned (e.g. \"Doesn't like Lattafa Khamrah; finds it too common\"). Don't announce it; keep talking.";
 
 const VOICE_TOOLS = [
   {
@@ -47,6 +51,18 @@ const VOICE_TOOLS = [
           },
         },
         required: ["request"],
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: REMEMBER_TOOL,
+      description: REMEMBER_DESCRIPTION,
+      parameters: {
+        type: "object",
+        properties: { fact: { type: "string", description: "One short fact, in the third person." } },
+        required: ["fact"],
       },
     },
   },
@@ -256,6 +272,8 @@ export interface SessionHooks {
    * May return a note to deliver right away instead (e.g. an answer already given earlier in the call).
    */
   onAskAgent(request: string): DeliveredNote | null;
+  /** The voice wants to remember a fact about the caller for future calls. */
+  onRemember?(fact: string): void;
   /** The model said goodbye; the session will close shortly. */
   onWrapUp(): void;
   /** Something worth keeping in the call log (e.g. a voice-model error). */
@@ -305,6 +323,14 @@ export function userAskedToEnd(text: string): boolean {
   return /\b(end the call|hang up|you can go( now)?|gotta go|got to go|bye|goodbye|let'?s end it|that'?s all for now)\b/i.test(text);
 }
 
+function parseArg(args: string, key: string): string {
+  try {
+    return String(JSON.parse(args || "{}")[key] ?? "").trim();
+  } catch {
+    return "";
+  }
+}
+
 function parseRequest(args: string): string {
   try {
     return String(JSON.parse(args || "{}").request ?? "").trim();
@@ -343,6 +369,8 @@ export class RealtimeSession {
   private endTimer: NodeJS.Timeout | null = null;
   private fillerIdx = 0;
   private toolSeq = 0;
+  /** Replies in a row that only saved a memory without speaking (guards against a loop). */
+  private silentRemembers = 0;
   /** Notes delivered but not yet used in a reply. */
   private freshNotes: { entry: ChatMessage; after: string }[] = [];
   private fillerTimer: NodeJS.Timeout | null = null;
@@ -541,7 +569,9 @@ export class RealtimeSession {
       let ok = await run(notes.length === 0);
       const validAsk = () =>
         toolCalls.some((c) => c.function.name === ASK_AGENT_TOOL && parseRequest(c.function.arguments));
-      if (ok && !spoken && toolCalls.length > 0 && !validAsk()) {
+      const validRemember = () =>
+        toolCalls.some((c) => c.function.name === REMEMBER_TOOL && parseArg(c.function.arguments, "fact"));
+      if (ok && !spoken && toolCalls.length > 0 && !validAsk() && !validRemember()) {
         log.warn(`voice model made an unusable tool call (${JSON.stringify(toolCalls).slice(0, 200)}); retrying without tools`);
         ok = await run(false);
       }
@@ -566,22 +596,45 @@ export class RealtimeSession {
       if (held !== null && !turnClosed && afterQuestion(held, true) !== "cut") speak(held);
       held = null;
 
+      // Memories are saved straight away, alongside whatever else the model did this turn.
+      const remembers = toolCalls
+        .filter((c) => c.function.name === REMEMBER_TOOL)
+        .map((c) => ({ call: c, fact: parseArg(c.function.arguments, "fact") }))
+        .filter((r) => r.fact);
+      for (const r of remembers) this.hooks.onRemember?.(r.fact);
       const ask = toolCalls.find((c) => c.function.name === ASK_AGENT_TOOL);
       let request = "";
       if (ask) request = parseRequest(ask.function.arguments);
+      const handled = [...remembers.map((r) => r.call), ...(ask && request ? [ask] : [])];
+      if (handled.length > 0) {
+        // Always our own ids: some models reuse ids, and duplicate ids make the provider reject the whole history.
+        for (const c of handled) c.id = `call_${++this.toolSeq}_${Date.now().toString(36)}`;
+        entry.tool_calls = handled;
+        // Tool results must directly follow their call, even if an answer arrived while this reply was streaming.
+        this.history.splice(
+          this.history.indexOf(entry) + 1,
+          0,
+          ...handled.map((c): ChatMessage => ({
+            role: "tool",
+            tool_call_id: c.id,
+            content:
+              c.function.name === REMEMBER_TOOL
+                ? "Saved."
+                : "Sent. The answer will arrive in a later message. Until then keep chatting naturally if the user " +
+                  "talks to you, but never guess or make up the answer.",
+          })),
+        );
+      }
+      if (remembers.length > 0 && !(ask && request) && !spoken.trim()) {
+        // It only saved a note: let it actually reply now (at most twice in a row, to avoid a loop).
+        closeTurn();
+        if (++this.silentRemembers <= 2) this.respondAgain = true;
+        return;
+      }
+      if (spoken.trim()) this.silentRemembers = 0;
       if (ask && request) {
         if (!spoken.trim()) speak(FILLERS[this.fillerIdx++ % FILLERS.length]);
         closeTurn();
-        // Always our own id: some models reuse ids, and duplicate ids make the provider reject the whole history.
-        ask.id = `call_${++this.toolSeq}_${Date.now().toString(36)}`;
-        entry.tool_calls = [ask];
-        this.history.push({
-          role: "tool",
-          tool_call_id: ask.id,
-          content:
-            "Sent. The answer will arrive in a later system message. Until then keep chatting naturally if the user " +
-            "talks to you, but never guess or make up the answer.",
-        });
         if (spoken.trim()) this.hooks.onAgent(spoken.trim());
         const immediate = this.hooks.onAskAgent(request);
         if (immediate) this.deliver(immediate);
@@ -768,6 +821,8 @@ export function buildSystemPrompt(o: {
   goal?: string;
   timezone: string;
   now: Date;
+  /** Saved facts about the user from earlier calls. */
+  memory?: string[];
 }): string {
   const time = o.now.toLocaleString("en-US", { timeZone: o.timezone, dateStyle: "full", timeStyle: "short" });
   const u = o.userName;
@@ -778,6 +833,9 @@ export function buildSystemPrompt(o: {
     o.reason ? `Why you called: ${o.reason}` : "",
     o.briefing ? `What you know:\n${o.briefing}` : "",
     o.goal ? `Goal of the call: ${o.goal}` : "",
+    o.memory?.length
+      ? `What you already know about ${u} from before (use it naturally; don't recite it):\n${o.memory.map((m) => `- ${m}`).join("\n")}`
+      : "",
     "",
     "Talk like a sharp, warm friend on the phone, not a chatbot. Everything you write is spoken aloud:",
     "- Two or three natural sentences per turn. React first (\"Oh nice.\", \"Got it.\"), use contractions, match their vibe.",
@@ -796,6 +854,8 @@ export function buildSystemPrompt(o: {
     "- Say a short line first (\"Let me check.\"), then pass their full request with every detail, plus anything",
     "  relevant they've told you on this call (budget, what they liked, what they already ruled out).",
     "- Remember what they've told you. Never suggest something they already turned down.",
+    "- When they tell you something about themselves worth knowing next time (likes, dislikes, budget, routines,",
+    "  people, plans), call remember with one short fact. Don't announce it; just keep the conversation going.",
     "- When they change or add details (budget, dates, preferences), call ask_agent again with the updated request.",
     "- Speak as yourself (\"I found\", \"I checked\"). Never mention a back office, a team, a tool or another assistant.",
     "  Never guess or invent an answer.",

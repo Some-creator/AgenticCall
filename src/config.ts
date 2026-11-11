@@ -94,6 +94,8 @@ export interface Config {
   groq: { apiKey: string | null; model: string; fallbackModel: string };
   /** Claude as the voice model (preferred when set); Groq becomes the backup. */
   anthropic: { apiKey: string | null; model: string };
+  /** Where long-term memory about the user is kept ("off" disables it). Use a persistent volume. */
+  memoryFile: string | null;
   relay: { ttsProvider?: string; voice?: string; transcriptionProvider?: string; speechModel?: string };
 }
 
@@ -160,6 +162,10 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
       process.env.CALL_MODE,
       Boolean(process.env.GROQ_API_KEY?.trim() || process.env.ANTHROPIC_API_KEY?.trim()),
     ),
+    memoryFile: (() => {
+      const v = optional("MEMORY_FILE", "data/memory.json");
+      return v.toLowerCase() === "off" ? null : v;
+    })(),
     anthropic: {
       apiKey: process.env.ANTHROPIC_API_KEY?.trim() || null,
       model: optional("ANTHROPIC_MODEL", "claude-haiku-5-5"),

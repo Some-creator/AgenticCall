@@ -8,6 +8,8 @@ import Anthropic, {
 import { log } from "./log.js";
 import {
   ASK_AGENT_TOOL,
+  REMEMBER_DESCRIPTION,
+  REMEMBER_TOOL,
   RateLimitedError,
   plainHistory,
   windowHistory,
@@ -31,6 +33,16 @@ const ASK_AGENT: Anthropic.Tool = {
       },
     },
     required: ["request"],
+  },
+};
+
+const REMEMBER: Anthropic.Tool = {
+  name: REMEMBER_TOOL,
+  description: REMEMBER_DESCRIPTION,
+  input_schema: {
+    type: "object",
+    properties: { fact: { type: "string", description: "One short fact, in the third person." } },
+    required: ["fact"],
   },
 };
 
@@ -91,7 +103,7 @@ export function anthropicLLM(apiKey: string, model: string): VoiceLLM {
           messages,
           thinking: { type: "disabled" },
           output_config: { effort: "low" },
-          tools: [ASK_AGENT],
+          tools: [ASK_AGENT, REMEMBER],
           tool_choice: toolsOff ? { type: "none" } : { type: "auto" },
           cache_control: { type: "ephemeral" },
         },

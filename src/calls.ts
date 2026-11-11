@@ -3,6 +3,7 @@ import twilio from "twilio";
 import type { WebSocket } from "ws";
 import { isQuietTime, type Config } from "./config.js";
 import { log } from "./log.js";
+import type { MemoryStore } from "./memory.js";
 import {
   RealtimeSession,
   answerNote,
@@ -195,14 +196,17 @@ export class CallManager {
 
   private now: () => number;
   private llm?: VoiceLLM;
+  /** Long-term notes about the user, shared with the agents. */
+  readonly memory?: MemoryStore;
 
   constructor(
     private cfg: Config,
     private tel: Telephony,
-    opts: { llm?: VoiceLLM; now?: () => number } = {},
+    opts: { llm?: VoiceLLM; now?: () => number; memory?: MemoryStore } = {},
   ) {
     this.llm = opts.llm;
     this.now = opts.now ?? Date.now;
+    this.memory = opts.memory;
   }
 
   // ---------------------------------------------------------------- agent side
@@ -692,6 +696,7 @@ export class CallManager {
 
     const llm = this.llm!;
     const system = buildSystemPrompt({
+      memory: this.memory?.list().map((n) => n.text),
       model: this.cfg.anthropic.apiKey ? this.cfg.anthropic.model : `${this.cfg.groq.model} on Groq`,
       callerName: rec.callerName,
       userName: this.cfg.userName,
@@ -740,6 +745,11 @@ export class CallManager {
         // If the agent doesn't answer (or estimate) in time, the voice model says so instead of leaving silence.
         this.armRequestTimer(rec, req, this.cfg.agentAnswerTimeoutSeconds * 1000);
         return null;
+      },
+      onRemember: (fact) => {
+        this.memory?.add(fact, "voice");
+        rec.transcript.push(this.turn("system", `Remembered: ${fact}`));
+        log.info(`call ${rec.id}: remembered "${fact}"`);
       },
       onNote: (text) => {
         rec.transcript.push(this.turn("system", text));

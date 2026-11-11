@@ -59,6 +59,12 @@ You **don't need `PUBLIC_BASE_URL`** on Railway. If it's unset, the server build
 `RAILWAY_PUBLIC_DOMAIN` variable. If you later add a custom domain, set
 `PUBLIC_BASE_URL=https://your.custom.domain`.
 
+### Optional: shared memory that survives redeploys
+The voice remembers facts about you across calls (likes, dislikes, budgets, routines) in `data/memory.json`.
+Without a volume it works but resets on every redeploy. To keep it: in the service, add a **Volume** with mount
+path **`/app/data`**. If the logs then say `memory: can't write /app/data/memory.json`, the volume isn't writable by
+the app's user; Railway documents a `RAILWAY_RUN_UID=0` variable for this case (check their volume docs).
+
 ### 3. Give it a public URL
 1. Go to **Settings → Networking → Generate Domain**.
 2. When it asks for a port, enter **3000**, the same value as `PORT` above.

@@ -21,6 +21,7 @@ import {
   type VoiceLLM,
 } from "../src/realtime.js";
 import { similarRequests } from "../src/calls.js";
+import { MemoryStore } from "../src/memory.js";
 
 const AUTH = "test_auth_token";
 const MCP_TOKEN = "secret-mcp-token";
@@ -94,6 +95,14 @@ const fakeLLM: VoiceLLM = {
     }
     if (messages.slice(-2).some((m) => m.content.toLowerCase().includes("flaky"))) {
       yield { type: "text", text: "Okay, back. What were you saying?" };
+      return;
+    }
+    if (lastMsg.role === "user" && last.includes("can't stand khamrah")) {
+      yield { type: "text", text: "Fair, no Khamrah then." };
+      yield {
+        type: "tool_call",
+        call: { id: "m1", type: "function", function: { name: "remember", arguments: '{"fact":"Doesn\'t like Lattafa Khamrah"}' } },
+      };
       return;
     }
     if (lastMsg.role === "user" && last.includes("ramble")) {
@@ -180,9 +189,10 @@ before(async () => {
     callbackThresholdSeconds: 60,
     groq: { apiKey: "x", model: "test", fallbackModel: "test" },
     anthropic: { apiKey: null, model: "test" },
+    memoryFile: null,
     relay: {},
   } satisfies Config as Config;
-  const calls = new CallManager(cfg, tel, { llm: fakeLLM });
+  const calls = new CallManager(cfg, tel, { llm: fakeLLM, memory: new MemoryStore(null) });
   const app = createApp(cfg, calls);
   server = await new Promise<Server>((r) => {
     const s = app.listen(0, "127.0.0.1", () => r(s));
@@ -613,6 +623,44 @@ test("a promised call back becomes an open request that rings the user when answ
   });
   assert.equal(dialed.length, before + 1);
   await twilioPost(dialed.at(-1)!.statusCallback, { CallStatus: "completed" });
+  tw.ws.close();
+  await client.close();
+});
+
+test("shared memory: the voice saves facts, agents can recall them, and the next call knows them", async () => {
+  const client = await mcp();
+  let n = dialed.length;
+  const callP = client.callTool({ name: "call_user", arguments: { message: "Hey.", timeout_seconds: 10 } });
+  while (dialed.length <= n) await sleep(10);
+  let { url, statusCallback } = dialed.at(-1)!;
+  let twiml = (await twilioPost(url, { CallStatus: "in-progress", AnsweredBy: "human" })).body;
+  let tw = await relay(attr(twiml, "url"));
+  tw.send({ type: "setup", callSid: `CA${dialed.length}`, customParameters: { cid: param(twiml, "cid"), secret: param(twiml, "secret") } });
+  tw.send({ type: "prompt", voicePrompt: "Honestly I can't stand Khamrah", last: true });
+  assert.equal(await tw.reply(), "Fair, no Khamrah then.");
+  await twilioPost(statusCallback, { CallStatus: "completed" });
+  await callP;
+  tw.ws.close();
+
+  const recalled = JSON.parse(((await client.callTool({ name: "recall", arguments: {} })) as any).content[0].text);
+  assert.deepEqual(recalled.notes.map((x: any) => x.text), ["Doesn't like Lattafa Khamrah"]);
+  await client.callTool({ name: "remember", arguments: { fact: "Budget for cologne is $30-50" } });
+
+  // Next call: the voice starts out knowing both facts.
+  n = dialed.length;
+  const call2 = client.callTool({ name: "call_user", arguments: { message: "Hey again.", timeout_seconds: 10 } });
+  while (dialed.length <= n) await sleep(10);
+  ({ url, statusCallback } = dialed.at(-1)!);
+  twiml = (await twilioPost(url, { CallStatus: "in-progress", AnsweredBy: "human" })).body;
+  tw = await relay(attr(twiml, "url"));
+  tw.send({ type: "setup", callSid: `CA${dialed.length}`, customParameters: { cid: param(twiml, "cid"), secret: param(twiml, "secret") } });
+  tw.send({ type: "prompt", voicePrompt: "What's up", last: true });
+  await tw.reply();
+  const system = llmCalls.at(-1)![0].content;
+  assert.match(system, /Doesn't like Lattafa Khamrah/);
+  assert.match(system, /Budget for cologne is \$30-50/);
+  await twilioPost(statusCallback, { CallStatus: "completed" });
+  await call2;
   tw.ws.close();
   await client.close();
 });
