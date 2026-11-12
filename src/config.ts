@@ -17,12 +17,30 @@ function bool(name: string, fallback: boolean): boolean {
   return ["1", "true", "yes", "on"].includes(v);
 }
 
-function int(name: string, fallback: number): number {
+function int(name: string, fallback: number, min = 0, max = Number.MAX_SAFE_INTEGER): number {
   const v = process.env[name]?.trim();
   if (!v) return fallback;
-  const n = Number.parseInt(v, 10);
-  if (Number.isNaN(n)) throw new Error(`${name} must be an integer, got "${v}"`);
+  if (!/^\d+$/.test(v)) throw new Error(`${name} must be a whole number, got "${v}"`);
+  const n = Number(v);
+  if (n < min || n > max) throw new Error(`${name} must be between ${min} and ${max}, got ${n}`);
   return n;
+}
+
+function callMode(raw: string | undefined, hasVoiceModel: boolean): "realtime" | "turn_by_turn" {
+  const v = raw?.trim().toLowerCase();
+  if (!v) return hasVoiceModel ? "realtime" : "turn_by_turn";
+  if (v === "realtime" || v === "turn_by_turn") {
+    if (v === "realtime" && !hasVoiceModel) {
+      throw new Error("CALL_MODE=realtime needs ANTHROPIC_API_KEY or GROQ_API_KEY");
+    }
+    return v;
+  }
+  throw new Error(`CALL_MODE must be "realtime" or "turn_by_turn", got "${raw}"`);
+}
+
+function speechEnd(v: string): string {
+  if (v === "auto" || /^\d+$/.test(v)) return v;
+  throw new Error(`SPEECH_END_TIMEOUT must be "auto" or whole seconds, got "${v}"`);
 }
 
 export interface QuietHours {
@@ -40,12 +58,25 @@ function parseQuietHours(raw: string | undefined): QuietHours | null {
 }
 
 export interface Config {
+  /** Twilio credentials, or null when Twilio isn't set up. */
   twilio: {
     accountSid: string;
     authToken: string;
     fromNumber: string;
     validateSignature: boolean;
-  };
+  } | null;
+  /** Telnyx credentials, or null when Telnyx isn't set up. */
+  /** publicKey is optional: without it, webhooks are checked with a per-call secret in the webhook URL. */
+  telnyx: {
+    apiKey: string;
+    connectionId: string;
+    fromNumber: string;
+    publicKey: string | null;
+    /** Text-to-speech voice for Telnyx calls, e.g. "Azure.en-US-BrianMultilingualNeural" or "AWS.Polly.Matthew-Neural". */
+    voice: string;
+  } | null;
+  /** Which provider places calls; null means phone calls are off. */
+  phoneProvider: "twilio" | "telnyx" | null;
   userPhoneNumber: string;
   userName: string;
   publicBaseUrl: string;
@@ -58,11 +89,27 @@ export interface Config {
   language: string;
   answeringMachineDetection: boolean;
   speechTimeoutSeconds: number;
+  /** Silence after speech before the turn ends: "auto" or whole seconds. */
+  speechEndTimeout: string;
+  speechModel: string;
+  ackPhrases: string[];
   maxHoldSeconds: number;
   maxCallSeconds: number;
   maxCallsPerHour: number;
   quietHours: QuietHours | null;
   timezone: string;
+  /** "realtime": a fast voice model on this server runs the conversation. "turn_by_turn": the calling agent answers each turn. */
+  defaultMode: "realtime" | "turn_by_turn";
+  /** How long the voice model waits for the calling agent to answer a mid-call request before saying so. */
+  agentAnswerTimeoutSeconds: number;
+  /** Requests estimated to take longer than this get a "stay on the line or call you back?" offer. */
+  callbackThresholdSeconds: number;
+  groq: { apiKey: string | null; model: string; fallbackModel: string };
+  /** Claude as the voice model (preferred when set); Groq becomes the backup. */
+  anthropic: { apiKey: string | null; model: string };
+  /** Where long-term memory about the user is kept ("off" disables it). Use a persistent volume. */
+  memoryFile: string | null;
+  relay: { ttsProvider?: string; voice?: string; transcriptionProvider?: string; speechModel?: string };
 }
 
 export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
@@ -73,22 +120,60 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     throw new Error(`MCP_TRANSPORT must be "http" or "stdio", got "${transport}"`);
   }
 
-  const publicBaseUrl = required("PUBLIC_BASE_URL").replace(/\/+$/, "");
-  if (!/^https?:\/\//.test(publicBaseUrl)) {
-    throw new Error("PUBLIC_BASE_URL must start with https:// (Twilio needs to reach it)");
+  // On Railway, fall back to the service's generated domain if PUBLIC_BASE_URL isn't set.
+  const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN?.trim();
+  if (!process.env.PUBLIC_BASE_URL?.trim() && railwayDomain) {
+    process.env.PUBLIC_BASE_URL = `https://${railwayDomain.replace(/^https?:\/\//, "")}`;
+  }
+  const rawBase = required("PUBLIC_BASE_URL");
+  let parsed: URL;
+  try {
+    parsed = new URL(/^https?:\/\//i.test(rawBase) ? rawBase : `https://${rawBase}`);
+  } catch {
+    throw new Error(`PUBLIC_BASE_URL is not a valid URL: "${rawBase}"`);
+  }
+  // Webhooks are always served from the root (/twilio/...), so keep only scheme + host.
+  // This tolerates values like "https://host/mcp" or "host.up.railway.app".
+  const publicBaseUrl = parsed.origin;
+  if (publicBaseUrl !== rawBase.replace(/\/+$/, "")) {
+    console.error(`WARN  PUBLIC_BASE_URL "${rawBase}" normalised to "${publicBaseUrl}"`);
   }
 
+  // Phone providers are optional: set up Twilio, Telnyx, or neither (then calls are off until one is added).
+  const twilio = process.env.TWILIO_ACCOUNT_SID?.trim()
+    ? {
+        accountSid: required("TWILIO_ACCOUNT_SID"),
+        authToken: required("TWILIO_AUTH_TOKEN"),
+        fromNumber: required("TWILIO_FROM_NUMBER"),
+        validateSignature: bool("TWILIO_VALIDATE_SIGNATURE", true),
+      }
+    : null;
+  const telnyx = process.env.TELNYX_API_KEY?.trim()
+    ? {
+        apiKey: required("TELNYX_API_KEY"),
+        connectionId: required("TELNYX_CONNECTION_ID"),
+        fromNumber: required("TELNYX_FROM_NUMBER"),
+        publicKey: process.env.TELNYX_PUBLIC_KEY?.trim() || null,
+        voice: optional("TELNYX_VOICE", "Azure.en-US-BrianMultilingualNeural"),
+      }
+    : null;
+  const wanted = process.env.PHONE_PROVIDER?.trim().toLowerCase();
+  if (wanted && wanted !== "twilio" && wanted !== "telnyx") {
+    throw new Error(`PHONE_PROVIDER must be "twilio" or "telnyx", got "${wanted}"`);
+  }
+  if (wanted === "twilio" && !twilio) throw new Error("PHONE_PROVIDER=twilio but TWILIO_ACCOUNT_SID isn't set");
+  if (wanted === "telnyx" && !telnyx) throw new Error("PHONE_PROVIDER=telnyx but TELNYX_API_KEY isn't set");
+  const phoneProvider: "twilio" | "telnyx" | null =
+    (wanted as "twilio" | "telnyx" | undefined) ?? (telnyx ? "telnyx" : twilio ? "twilio" : null);
+
   return {
-    twilio: {
-      accountSid: required("TWILIO_ACCOUNT_SID"),
-      authToken: required("TWILIO_AUTH_TOKEN"),
-      fromNumber: required("TWILIO_FROM_NUMBER"),
-      validateSignature: bool("TWILIO_VALIDATE_SIGNATURE", true),
-    },
+    twilio,
+    telnyx,
+    phoneProvider,
     userPhoneNumber: required("USER_PHONE_NUMBER"),
     userName: optional("USER_NAME", "there"),
     publicBaseUrl,
-    port: int("PORT", 3000),
+    port: int("PORT", 3000, 1, 65535),
     host: optional("HOST", "0.0.0.0"),
     transport,
     mcpAuthToken: process.env.MCP_AUTH_TOKEN?.trim() || null,
@@ -96,12 +181,44 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     voice: optional("TWILIO_VOICE", "Polly.Joanna-Neural"),
     language: optional("CALL_LANGUAGE", "en-US"),
     answeringMachineDetection: bool("ANSWERING_MACHINE_DETECTION", true),
-    speechTimeoutSeconds: int("SPEECH_TIMEOUT_SECONDS", 8),
-    maxHoldSeconds: int("MAX_HOLD_SECONDS", 120),
-    maxCallSeconds: int("MAX_CALL_SECONDS", 900),
-    maxCallsPerHour: int("MAX_CALLS_PER_HOUR", 6),
+    speechTimeoutSeconds: int("SPEECH_TIMEOUT_SECONDS", 8, 1, 60),
+    speechEndTimeout: speechEnd(optional("SPEECH_END_TIMEOUT", "auto")),
+    speechModel: optional("SPEECH_MODEL", "phone_call"),
+    ackPhrases: (process.env.ACK_PHRASES ?? "Mm-hm.|Okay.|Hmm.|Right.")
+      .split("|")
+      .map((p) => p.trim())
+      .filter(Boolean),
+    maxHoldSeconds: int("MAX_HOLD_SECONDS", 120, 10, 3600),
+    maxCallSeconds: int("MAX_CALL_SECONDS", 900, 30, 14400),
+    maxCallsPerHour: int("MAX_CALLS_PER_HOUR", 6, 1, 1000),
     quietHours: parseQuietHours(process.env.QUIET_HOURS),
     timezone: optional("TIMEZONE", "America/New_York"),
+    agentAnswerTimeoutSeconds: int("AGENT_ANSWER_TIMEOUT_SECONDS", 45, 5, 600),
+    callbackThresholdSeconds: int("CALLBACK_THRESHOLD_SECONDS", 60, 5, 3600),
+    defaultMode: callMode(
+      process.env.CALL_MODE,
+      Boolean(process.env.GROQ_API_KEY?.trim() || process.env.ANTHROPIC_API_KEY?.trim()),
+    ),
+    memoryFile: (() => {
+      const v = optional("MEMORY_FILE", "data/memory.json");
+      return v.toLowerCase() === "off" ? null : v;
+    })(),
+    anthropic: {
+      apiKey: process.env.ANTHROPIC_API_KEY?.trim() || null,
+      model: optional("ANTHROPIC_MODEL", "claude-haiku-5-5"),
+    },
+    groq: {
+      apiKey: process.env.GROQ_API_KEY?.trim() || null,
+      model: optional("GROQ_MODEL", "openai/gpt-oss-120b"),
+      // Comma-separated; each Groq model has its own rate limit, so more models = fewer stalls.
+      fallbackModel: optional("GROQ_FALLBACK_MODEL", "openai/gpt-oss-120b,openai/gpt-oss-20b"),
+    },
+    relay: {
+      ttsProvider: process.env.RELAY_TTS_PROVIDER?.trim() || undefined,
+      voice: process.env.RELAY_VOICE?.trim() || undefined,
+      transcriptionProvider: process.env.RELAY_TRANSCRIPTION_PROVIDER?.trim() || undefined,
+      speechModel: process.env.RELAY_SPEECH_MODEL?.trim() || undefined,
+    },
   };
 }
 

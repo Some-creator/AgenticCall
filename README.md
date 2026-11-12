@@ -1,187 +1,187 @@
 # AgenticCall
 
-An MCP server that lets AI agents like **Meta Muse** and **Claude Duet** **phone you** through Twilio
-when something important comes up, and then **hold a live two-way voice conversation**. The agent
-speaks, hears what you say back, and responds, all on the same call.
+**An MCP server that lets AI agents phone you and hold a natural, real-time voice conversation.**
 
+Your AI agent (Claude, Meta Muse, or any app that supports MCP connectors) decides something needs your
+attention, such as a meeting change, an urgent email or a decision it's blocked on, and **calls your real
+phone**. You talk to it like a person. Ask it something mid-call ("what's on my calendar Friday?") and it
+checks with your agent's own tools while you keep talking. When you hang up, the agent gets a summary,
+your decisions and the full transcript, and gets to work.
+
+```text
+📞  "Hey Haider, it's Claude. Your 3pm with Dana got moved to 2. Want me to accept?"
+🙋  "Yeah, and what else is on my calendar tomorrow?"
+📞  "Let me check... Pretty light: HackerRank at eleven, then the gym at eight."
+🙋  "Cool, that's all."
+📞  "Done, I accepted the 2pm. Talk soon!"            → agent receives decisions + transcript
 ```
- AI agent (Muse / Duet / Claude)                 AgenticCall server                    Twilio            You
- ───────────────────────────────                 ──────────────────                    ──────            ───
- call_user("Your 3pm moved to 2pm. Accept?") ──►  dial  ───────────────────────────►  rings  ───────►  📞 answer
-                                                  <Say> greeting + message, <Gather> ◄──────────────── "Yes, accept it"
- ◄── { user_said: "Yes, accept it" }              speech-to-text result
- say_on_call("Done. Anything else?")         ──►  (you hear hold silence while the agent thinks)
-                                                  <Say> + <Gather>  ─────────────────────────────────► "No, that's all"
- ◄── { user_said: "No, that's all" }
- end_call("Great, bye!")                     ──►  <Say> + <Hangup>
-```
 
-## Features
-
-- **Two-way voice.** Twilio speech recognition turns your words into text for the agent, and neural
-  TTS reads the agent's replies. You can interrupt (barge in) while it is talking.
-- **Voicemail aware.** If voicemail picks up, it leaves the message and **texts it to you** too.
-  It also texts you if you don't answer or the line is busy.
-- **Guardrails.**
-  - It can only call or text `USER_PHONE_NUMBER`, so an agent can't dial anyone else.
-  - Quiet hours: only `urgency: "critical"` calls ring during that window.
-  - There is an hourly call limit, and only one call can be active at a time.
-  - Twilio webhook signatures are validated.
-  - The MCP endpoint requires a bearer token.
-- **Both MCP transports.**
-  - Streamable HTTP at `/mcp` for cloud agents such as Muse, Duet and claude.ai connectors.
-  - `stdio` for Claude Desktop and Claude Code.
-
-## Tools exposed to the agent
-
-| Tool | What it does |
-|---|---|
-| `call_user` | Rings you, greets you ("Hi Sam, this is Muse."), says the message, and returns what you said back. |
-| `say_on_call` | Says the next line on the live call and returns your reply (`listen: false` just speaks). |
-| `wait_for_reply` | Keeps listening if a result came back with `still_waiting: true`, for example while the phone is still ringing. |
-| `end_call` | Says goodbye, hangs up, and returns the transcript. |
-| `get_call` / `list_calls` | Return call status and transcripts. |
-| `send_sms` | Texts you for things that don't need a call, or as a summary after one. |
-
-The server also sends the agent **instructions** covering three things: when a call is warranted, how
-to write for speech (short sentences, no markdown) and how to run the conversation loop.
+**Stack:** TypeScript, Node.js, Model Context Protocol (Streamable HTTP and stdio), Twilio Voice and
+ConversationRelay (Telnyx also supported), Claude Haiku 5.5 with Groq models as automatic backup,
+WebSockets, Express, Docker, Railway.
+**Size:** about 3,300 lines of TypeScript, plus about 1,200 lines of tests (26 tests, all offline).
 
 ---
 
-## 1. Twilio setup
+## Highlights
 
-1. Create an account at [twilio.com](https://www.twilio.com) and buy a **voice-capable phone number**.
-2. From the Console dashboard, copy your **Account SID** and **Auth Token**.
-3. On a **trial account**:
-   - Verify your own phone number under *Phone Numbers → Verified Caller IDs*.
-   - Calls will start with a short Twilio trial notice. Upgrading removes it.
-4. Calling some countries needs Geo Permissions enabled (*Voice → Settings → Geo permissions*).
+- **Real-time, interruptible voice.** Replies stream to text-to-speech token by token, so the first
+  word arrives in under a second. You can talk over it and it stops and listens.
+- **A live bridge to your agent.** A fast voice model holds the conversation. Anything it can't answer
+  itself goes to your agent mid-call through MCP, and the voice reads the answer back in its own words.
+  Slow tasks get a time estimate and an offer to call you back when they're done.
+- **Automatic callbacks.** If you hang up before a task finishes, the server calls you back with the
+  result as soon as the agent submits it.
+- **Shared long-term memory.** The voice saves facts you mention ("doesn't like Khamrah", "budget is
+  $50") and loads them into every future call. Every connected AI can read and add to the same memory.
+- **Works with many AIs and providers.** Any MCP-capable agent can connect (Claude, Muse, ChatGPT,
+  Cursor and others). Voice runs on **Twilio** or **Telnyx**; the AI runs on **Claude Haiku** with
+  **Groq** taking over automatically when it's rate-limited or unavailable.
+- **Guardrails.**
+  - It can only ever call one configured number.
+  - Quiet hours, an hourly call limit, and only one active call at a time.
+  - Twilio webhook signatures and Telnyx webhook signatures (or per-call secrets) are verified.
+  - The MCP endpoint is token-protected.
 
-You don't need to configure webhooks on the number. The server passes its URLs to Twilio on every call.
+## Architecture
 
-## 2. Configure
+```mermaid
+flowchart LR
+  subgraph Agents["AI agents (MCP clients)"]
+    A1[Claude]
+    A2[Meta Muse]
+    A3[Any MCP app]
+  end
+  subgraph Server["AgenticCall server (Node/TypeScript)"]
+    M[MCP tools<br/>call_user, answer_on_call, recall...]
+    C[Call manager<br/>state, limits, callbacks]
+    V[Real-time voice session<br/>streaming, barge-in, turn-taking]
+    L[Voice model<br/>Claude Haiku, Groq backup]
+    S[(Shared memory)]
+  end
+  P[Twilio / Telnyx<br/>phone network, speech-to-text, text-to-speech]
+  U((You))
 
-```bash
-cp .env.example .env
+  A1 & A2 & A3 -- Streamable HTTP --> M
+  M --> C
+  C <--> V
+  V <--> L
+  C <--> S
+  C -- dial / webhooks --> P
+  V <-- WebSocket relay --> P
+  P <-- phone call --> U
 ```
 
-Fill in `TWILIO_*`, `USER_PHONE_NUMBER`, `PUBLIC_BASE_URL` and `MCP_AUTH_TOKEN`. Generate the token with:
+**How a call flows**
 
-```bash
-openssl rand -hex 32
-```
+1. The agent calls `call_user` with an opening line, a briefing (facts it may need) and a goal.
+2. The server dials through Twilio or Telnyx. When you answer, the provider opens a **ConversationRelay**
+   WebSocket: your speech arrives as text, and the server streams reply text back to be spoken.
+3. A fast voice model runs the conversation, using the briefing plus everything saved in shared memory.
+4. When you ask for something only the agent can do, the voice calls an internal `ask_agent` tool and
+   covers the gap ("Let me check."). The agent, waiting on `wait_for_reply`, receives the request with
+   the recent conversation, uses its own tools (email, calendar, web...), and replies with
+   `answer_on_call`.
+5. When you hang up, the agent receives a summary, your decisions, follow-ups and the transcript.
 
-## 3. Run it somewhere Twilio can reach
+## Engineering notes
 
-Twilio has to reach your server over public HTTPS. Cloud agents like Muse and Duet run in the cloud,
-so they need a public URL too. A server on your laptop's localhost won't work for them.
+These came out of many live test calls, each followed by reading the transcript and fixing what went
+wrong:
 
-**Option A: deploy the Docker image (recommended).** Works on Render, Railway, Fly.io, a VPS, and so on.
+- **Turn-taking.**
+  - Stops a reply when the model starts answering on your behalf after asking you a question.
+  - Doesn't answer a bare "okay" after an open-ended question; it waits for you to go on.
+  - Merges sentences the speech recognizer split in two, so they get one reply.
+  - Ignores provider "interrupts" that arrive after a reply has already finished playing.
+- **Hanging up safely.** It only hangs up when you've said goodbye or asked it to, never on its own,
+  and talking over a goodbye cancels the hang-up.
+- **Robust tool calls across models.**
+  - The first sentence is held back until it's complete, so a reply that turns into a broken tool call
+    is retried without tools instead of leaving you with half a word.
+  - Tool-call IDs are generated on the server, so models that reuse IDs can't break the history.
+  - Tool results are always placed directly after their call.
+- **Reliability under rate limits.**
+  - Rotates across several models when one is rate-limited, waiting as long as the provider asks.
+  - Retries quietly rather than repeating "sorry".
+  - Never hangs up just because the model had a short outage.
+- **Cost control.**
+  - A short per-turn prompt.
+  - A history window that moves in fixed steps, so Claude's prompt cache keeps working.
+  - Older turns are trimmed in a way that never loses the agent's answers or what you said.
+- **Speech-safe output.** Markdown and stage directions like "[No response needed]" are stripped before
+  speaking. Long answers are capped at sentence boundaries, and multi-part answers are announced and
+  covered in full.
+- **Operations.**
+  - On redeploy, the server waits for live calls to finish before shutting down.
+  - Phone providers are optional: with none set up, the server still runs and calls are just off.
+  - Errors are recorded in each call's transcript so they can be diagnosed without server logs.
 
-```bash
-docker build -t agentic-call .
-```
+## MCP tools
 
-```bash
-docker run -p 3000:3000 --env-file .env agentic-call
-```
+| Tool | Purpose |
+|---|---|
+| `call_user` | Ring the user with an opening line, a briefing and a goal. In real-time mode, returns mid-call requests and then the outcome. |
+| `wait_for_reply` | Keep listening for mid-call requests (`agent_requests`) or the end-of-call outcome. |
+| `answer_on_call` | Answer a mid-call request; the voice tells the user straight away. |
+| `acknowledge_request` | Give a time estimate for slow work; long estimates offer the user a call back. |
+| `say_on_call` / `end_call` | Speak on the call directly, or say goodbye and hang up. |
+| `remember` / `recall` / `forget` | Shared long-term memory about the user, used on every call. |
+| `get_call` / `list_calls` | Call status, outcomes and transcripts. |
+| `send_sms` | Text the user (Twilio). |
 
-Set `PUBLIC_BASE_URL` to the service's public URL, for example `https://agentic-call.onrender.com`.
+There is also a **turn-by-turn** mode where the agent itself answers every turn; it's slower, but needs
+no voice-model key.
 
-**Option B: run locally with a tunnel** (handy for testing).
+## Quick start
 
-```bash
-npm install && npm run build
-```
+1. **Phone provider.** Get a Twilio number (see Twilio setup below) or a Telnyx one ([`docs/TELNYX.md`](docs/TELNYX.md)).
+2. **Voice model key.** Add `ANTHROPIC_API_KEY` (Claude Haiku), plus `GROQ_API_KEY` as a free backup.
+3. **Configure.**
+   ```bash
+   cp .env.example .env
+   ```
+   Fill in the provider credentials, `USER_PHONE_NUMBER`, `PUBLIC_BASE_URL` and `MCP_AUTH_TOKEN`.
+   Generate the token with:
+   ```bash
+   openssl rand -hex 32
+   ```
+4. **Deploy** somewhere with public HTTPS. There's a step-by-step [Railway guide](docs/RAILWAY.md) and a
+   `Dockerfile` for anywhere else. For persistent memory, mount a volume at `/app/data`.
+5. **Connect your AI.** Add a custom connector with `https://<your-host>/mcp?token=<MCP_AUTH_TOKEN>`.
+   - **Claude:** Settings → Connectors → Add custom connector.
+   - **Meta Muse:** Custom Connector.
+   - **Claude Code:**
+     ```bash
+     claude mcp add --transport http agentic-call https://<your-host>/mcp --header "Authorization: Bearer <MCP_AUTH_TOKEN>"
+     ```
+6. **Tell your agent when to call**, for example:
+   > Every hour, check my email and calendar. If anything is urgent or time-sensitive, call me with
+   > `call_user`; text me for things that can wait.
 
-```bash
-ngrok http 3000
-```
+### Twilio setup
+1. Create an account at [twilio.com](https://www.twilio.com) and buy a voice-capable number.
+2. Copy your **Account SID** and **Auth Token** into `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN` and
+   `TWILIO_FROM_NUMBER`.
+3. On a trial account, also verify your own number under *Verified Caller IDs*.
 
-Put the ngrok `https://…` URL into `PUBLIC_BASE_URL`, then start the server:
+You don't need to configure webhooks on the number: the server passes its URLs to Twilio on every call.
 
-```bash
-npm start
-```
+## Configuration
 
-To check it's up, `GET https://<your-host>/` should return `{"ok":true}`.
-
-## 4. Connect your agents
-
-Your MCP URL:
-
-```
-https://<your-host>/mcp
-```
-
-The URL needs auth in one of two forms:
-- The header `Authorization: Bearer <MCP_AUTH_TOKEN>`
-- For clients that only accept a URL: `https://<your-host>/mcp?token=<MCP_AUTH_TOKEN>`
-
-Treat the token like a password, because anyone holding the URL with the token can make your phone ring.
-
-### Meta Muse
-Muse doesn't have a documented "add MCP server" setting. Third-party guides describe adding one
-through a **Custom Connector**: you tell Muse to connect to a remote MCP server over Streamable HTTP
-and give it the URL above. Muse Code takes MCP servers in its settings file. Use the `?token=` URL
-form if it can't send headers.
-
-### Claude Duet / Claude (claude.ai, desktop, mobile)
-Go to **Settings → Connectors → Add custom connector** and paste
-`https://<your-host>/mcp?token=<MCP_AUTH_TOKEN>`.
-
-### Claude Desktop / Claude Code (local, stdio)
-In stdio mode the server still opens `PORT` for Twilio webhooks, so you still need `PUBLIC_BASE_URL`
-(a tunnel works).
-
-```json
-{
-  "mcpServers": {
-    "agentic-call": {
-      "command": "node",
-      "args": ["/path/to/AgenticCall/dist/index.js", "--stdio"],
-      "env": {
-        "TWILIO_ACCOUNT_SID": "AC…",
-        "TWILIO_AUTH_TOKEN": "…",
-        "TWILIO_FROM_NUMBER": "+1…",
-        "USER_PHONE_NUMBER": "+1…",
-        "PUBLIC_BASE_URL": "https://your-tunnel.ngrok.app"
-      }
-    }
-  }
-}
-```
-
-Or connect Claude Code to the remote HTTP server:
-
-```bash
-claude mcp add --transport http agentic-call https://<your-host>/mcp --header "Authorization: Bearer <MCP_AUTH_TOKEN>"
-```
-
-## 5. Tell your agent when to call you
-
-An MCP server only gives the agent the *ability* to call you. The agent still decides *when*.
-
-To get calls for important tasks and notifications, give the agent something that runs on its own:
-a scheduled task, a background check, or a standing instruction. For example:
-
-> Every hour, check my email, calendar and task list. If anything is urgent or time-sensitive
-> (a meeting change in the next 3 hours, a message from my boss, a failed payment, a security alert),
-> call me with `call_user`. Briefly explain it and ask what I want to do, then act on my answer.
-> Text me with `send_sms` for anything that matters but can wait. Otherwise do nothing.
-
-## Configuration reference
-
-All options are listed in [`.env.example`](.env.example). The main ones:
+All options are in [`.env.example`](.env.example). The most useful:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `QUIET_HOURS` / `TIMEZONE` | unset / `America/New_York` | Example: `22:00-07:00`. Only `critical` calls ring during this window. |
-| `MAX_CALLS_PER_HOUR` | `6` | `critical` calls bypass this limit. |
-| `TWILIO_VOICE` | `Polly.Joanna-Neural` | Any voice Twilio `<Say>` supports. |
-| `ANSWERING_MACHINE_DETECTION` | `true` | Uses Twilio AMD; adds a few seconds before the greeting. |
-| `SPEECH_TIMEOUT_SECONDS` | `8` | Silence before the "are you still there?" re-prompt. |
-| `MAX_HOLD_SECONDS` | `120` | Hangs up politely if the agent stops responding. |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` | unset / `claude-haiku-5-5` | Main voice model. |
+| `GROQ_API_KEY` / `GROQ_MODEL` / `GROQ_FALLBACK_MODEL` | unset / `openai/gpt-oss-120b` / `openai/gpt-oss-120b,openai/gpt-oss-20b` | Backup voice models, rotated on rate limits. |
+| `PHONE_PROVIDER` | Telnyx if set up, else Twilio | `twilio` or `telnyx`. |
+| `MEMORY_FILE` | `data/memory.json` | Shared memory; use a persistent volume. `off` disables it. |
+| `QUIET_HOURS` / `TIMEZONE` | unset / `America/New_York` | For example `22:00-07:00`; only `critical` calls ring then. |
+| `MAX_CALLS_PER_HOUR` | `6` | `critical` calls bypass this. |
+| `ANSWERING_MACHINE_DETECTION` | `true` | Voicemail detection with an SMS fallback (Twilio); turn off to save cost. |
+| `TELNYX_VOICE` | `Azure.en-US-BrianMultilingualNeural` | Voice on Telnyx calls. |
+| `AGENT_ANSWER_TIMEOUT_SECONDS` / `CALLBACK_THRESHOLD_SECONDS` | `45` / `60` | When to say "it's taking longer" and when to offer a call back. |
 
 ## Development
 
@@ -197,12 +197,25 @@ npm test
 npm run dev
 ```
 
-The tests run a full simulated call with no network access. They drive signed Twilio webhooks and a
-real MCP client through answer → speech → agent reply → re-prompt on silence → hang-up, and they also
-cover voicemail with the SMS fallback, quiet hours and auth.
+The tests run complete simulated calls offline:
+- signed Twilio and Telnyx webhooks, and a fake ConversationRelay WebSocket;
+- a real MCP client and a scripted voice model;
+- mid-call agent requests, callbacks, interruptions, rate-limit recovery, shared memory and turn-taking.
 
-### Notes and limits
-- Call state is kept in memory. Run a **single instance**, and calls in progress are lost on restart.
-- While the agent is thinking, you hear silence. Turn latency is speech recognition time plus the
-  agent's own response time, typically a few seconds.
-- Twilio bills per call minute, per speech-recognition request and per SMS. See Twilio pricing.
+To place a real call through a deployed server and play the agent from your terminal:
+
+```bash
+npm run test-call -- https://<your-host>/mcp <MCP_AUTH_TOKEN>
+```
+
+## Limitations
+
+- Call state lives in memory, so run a single instance. Shared memory persists to disk.
+- Phone minutes are billed by the provider (a few cents per call). The voice model costs well under a
+  cent per call with prompt caching.
+- Agents only learn what they ask for (MCP is pull-based), so an agent has to keep listening with
+  `wait_for_reply` during a call to answer mid-call requests.
+
+## License
+
+MIT

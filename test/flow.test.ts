@@ -20,6 +20,7 @@ const sms: string[] = [];
 let quiet = false;
 
 const fakeTel: Telephony = {
+  provider: "twilio",
   async createCall(o) {
     dialed.push(o);
     return { sid: `CA${dialed.length}` };
@@ -34,6 +35,8 @@ const fakeTel: Telephony = {
 before(async () => {
   cfg = {
     twilio: { accountSid: "AC123", authToken: AUTH, fromNumber: "+15550000000", validateSignature: true },
+    telnyx: null,
+    phoneProvider: "twilio",
     userPhoneNumber: "+15551112222",
     userName: "Sam",
     publicBaseUrl: "",
@@ -46,11 +49,21 @@ before(async () => {
     language: "en-US",
     answeringMachineDetection: true,
     speechTimeoutSeconds: 8,
+    speechEndTimeout: "auto",
+    speechModel: "phone_call",
+    ackPhrases: ["Mm-hm."],
     maxHoldSeconds: 120,
     maxCallSeconds: 900,
     maxCallsPerHour: 6,
     quietHours: null,
     timezone: "America/New_York",
+    defaultMode: "turn_by_turn",
+    agentAnswerTimeoutSeconds: 45,
+    callbackThresholdSeconds: 60,
+    groq: { apiKey: null, model: "test", fallbackModel: "test" },
+    anthropic: { apiKey: null, model: "test" },
+    memoryFile: null,
+    relay: {},
   };
   const calls = new CallManager(cfg, fakeTel);
   const app = createApp(cfg, calls);
@@ -101,7 +114,7 @@ test("rejects unsigned Twilio webhooks", async () => {
 test("full two-way conversation", async () => {
   const client = await mcpClient();
   const tools = (await client.listTools()).tools.map((t) => t.name).sort();
-  assert.deepEqual(tools, ["call_user", "end_call", "get_call", "list_calls", "say_on_call", "send_sms", "wait_for_reply"]);
+  assert.deepEqual(tools, ["acknowledge_request", "answer_on_call", "call_user", "end_call", "forget", "get_call", "list_calls", "recall", "remember", "say_on_call", "send_sms", "wait_for_reply"]);
 
   const callP = client.callTool({
     name: "call_user",
@@ -113,10 +126,11 @@ test("full two-way conversation", async () => {
   await twilioPost(statusCallback, { CallStatus: "ringing" });
   const answered = await twilioPost(url, { CallStatus: "in-progress", AnsweredBy: "human" });
   assert.match(answered.body, /<Gather[^>]*input="speech"/);
-  assert.match(answered.body, /Hi Sam, this is Muse\. Your 3pm meeting moved to 2pm\. Should I accept\?/);
+  assert.match(answered.body, /Hi Sam, it's Muse\. Your 3pm meeting moved to 2pm\. Should I accept\?/);
 
   const afterSpeech = await twilioPost(urlFor("gather", statusCallback), { SpeechResult: "Yes, accept it.", Confidence: "0.93" });
-  assert.match(afterSpeech.body, /<Redirect[^>]*>[^<]*\/twilio\/hold/);
+  assert.match(afterSpeech.body, /<Say[^>]*>Mm-hm\.<\/Say><Redirect[^>]*>[^<]*\/twilio\/hold/);
+  assert.doesNotMatch(afterSpeech.body, /<Pause/);
 
   const first = parse(await callP);
   assert.equal(first.user_said, "Yes, accept it.");
